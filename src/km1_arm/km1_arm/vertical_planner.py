@@ -23,8 +23,6 @@ from .control_geometry import (
     PAPER_DEPTH_MM,
     PAPER_WIDTH_MM,
     paper_to_robot,
-    placement_command_paper,
-    placement_to_robot,
 )
 
 
@@ -48,15 +46,8 @@ def _normalise_angle(angle_deg: float) -> float:
     return (float(angle_deg) + 180.0) % 360.0 - 180.0
 
 
-def _vertical_pwms(
-    ik,
-    paper_point: np.ndarray,
-    z_mm: float,
-    *,
-    placement: bool = False,
-):
-    transform = placement_to_robot if placement else paper_to_robot
-    robot_x, robot_y = transform(*paper_point)
+def _vertical_pwms(ik, paper_point: np.ndarray, z_mm: float):
+    robot_x, robot_y = paper_to_robot(*paper_point)
     pwms = ik.solve_vertical(robot_x, robot_y, z_mm)
     if pwms is None:
         return None
@@ -214,13 +205,11 @@ def _select_reachable_layout_translation(
                     ik,
                     point,
                     travel_z_mm,
-                    placement=True,
                 )
                 drop_pwms = _vertical_pwms(
                     ik,
                     point,
                     drop_z_mm,
-                    placement=True,
                 )
                 if travel_pwms is None or drop_pwms is None:
                     reachable = False
@@ -234,8 +223,7 @@ def _select_reachable_layout_translation(
                 pick_robot_x, pick_robot_y = paper_to_robot(
                     *draft["source_grasp"]
                 )
-                place_robot_x, place_robot_y = placement_to_robot(*point)
-                place_command = placement_command_paper(*point)
+                place_robot_x, place_robot_y = paper_to_robot(*point)
                 pick_base_deg = math.degrees(
                     math.atan2(pick_robot_x, pick_robot_y)
                 )
@@ -270,7 +258,6 @@ def _select_reachable_layout_translation(
                 solved_by_piece[int(draft["piece_id"])] = {
                     "place_travel": list(travel_pwms),
                     "place_drop": list(drop_pwms),
-                    "place_command_paper": list(place_command),
                     "pick_tool_yaw_deg": pick_tool_yaw_deg,
                     "place_tool_yaw_deg": place_tool_yaw_deg,
                     "base_rotation_deg": base_rotation_deg,
@@ -435,18 +422,6 @@ def build_vertical_control_plan(
                 "piece_id": piece_id,
                 "pick": np.round(draft["source_grasp"], 3).tolist(),
                 "place": np.round(destination_grasp, 3).tolist(),
-                "place_command": np.round(
-                    place_pwms[piece_id]["place_command_paper"],
-                    3,
-                ).tolist(),
-                "placement_compensation_mm": np.round(
-                    np.asarray(
-                        place_pwms[piece_id]["place_command_paper"],
-                        dtype=np.float64,
-                    )
-                    - destination_grasp,
-                    3,
-                ).tolist(),
                 "source_center": np.round(draft["source_center"], 3).tolist(),
                 "target_center": np.round(target_center, 3).tolist(),
                 "source_polygon": np.round(draft["source_polygon"], 3).tolist(),
