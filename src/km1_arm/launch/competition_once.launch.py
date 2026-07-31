@@ -57,7 +57,9 @@ def generate_launch_description():
                 parameters=[
                     {
                         "enable_automatic_motion": enable_motion,
-                        "paper_surface_z_mm": 0.0,
+                        # Raised paper is 30 mm above the floor while the
+                        # robot base board is 10 mm above the floor.
+                        "paper_surface_z_mm": 20.0,
                         "pick_clearance_mm": 20.0,
                         "tool_length_mm": 50.0,
                         "travel_clearance_mm": 150.0,

@@ -19,12 +19,12 @@ PAPER_DEPTH_MM = 210.0
 PAPER_WIDTH_MM = 297.0
 BASE_FRONT_RADIUS_MM = 55.0
 
-# Camera optical-centre projection measured from the coincident midpoint of
-# the A4 near long edge and the circular-base front edge.  Positive x points
-# to the physical right; positive y points away from the robot over the A4.
-CAMERA_FROM_NEAR_EDGE_X_MM = 25.0
-CAMERA_FROM_NEAR_EDGE_Y_MM = 30.0
-CAMERA_HEIGHT_ABOVE_PAPER_MM = 600.0
+# Current camera extrinsics.  The optical-centre projection coincides with
+# the midpoint of the A4 near long edge.  The lens is 460 mm above the floor
+# and the raised paper is 30 mm above the floor.
+CAMERA_FROM_NEAR_EDGE_X_MM = 0.0
+CAMERA_FROM_NEAR_EDGE_Y_MM = 0.0
+CAMERA_HEIGHT_ABOVE_PAPER_MM = 430.0
 CAMERA_ROBOT_X_MM = CAMERA_FROM_NEAR_EDGE_X_MM
 CAMERA_ROBOT_Y_MM = BASE_FRONT_RADIUS_MM + CAMERA_FROM_NEAR_EDGE_Y_MM
 
