@@ -184,8 +184,22 @@ class ArmController(Node):
                 plan,
                 pixels_per_mm=float(envelope["pixels_per_mm"]),
             )
+            total_piece_count = int(
+                plan[0].get("total_piece_count", len(plan))
+            )
+            skipped_piece_ids = list(
+                plan[0].get("skipped_piece_ids", [])
+            )
+            if skipped_piece_ids:
+                self.get_logger().warning(
+                    "Partial execution selected: "
+                    f"planned={len(plan)}/{total_piece_count}, "
+                    f"skipped={skipped_piece_ids}. Reachable pieces will "
+                    "continue in -90-first order."
+                )
             self.get_logger().info(
-                f"Accepted schema-v2 envelope: {len(plan)} pieces; "
+                "Accepted schema-v2 envelope: "
+                f"planned={len(plan)}/{total_piece_count} pieces; "
                 f"pick={plan[0]['pick_z_mm']:.1f} mm; "
                 f"selected_travel={plan[0]['travel_z_mm']:.1f} mm; "
                 f"drop={plan[0]['drop_z_mm']:.1f} mm; "
@@ -333,7 +347,7 @@ class ArmController(Node):
                 self._wait_move()
 
                 # PLACE: both high travel and release remain vertical.  The
-                # +/-8 degree fallback is exclusive to pickup contact.
+                # +/-10 degree fallback is exclusive to pickup contact.
                 self.move_precomputed_pwms(
                     command["pwms"]["place_travel"],
                     self.move_time_ms,

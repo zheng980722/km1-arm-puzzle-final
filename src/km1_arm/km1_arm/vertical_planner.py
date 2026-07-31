@@ -36,24 +36,15 @@ DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
 TARGET_LAYOUT_LEFT_OFFSET_MM = 10.0
 VERTICAL_ALPHA_DEG = -90.0
-# Pickup contact may deviate by at most +/-8 degrees from vertical.  The order
-# is deliberate: exact vertical first, then the smallest symmetric deviation.
-PICK_CONTACT_ALPHA_OFFSETS_DEG = tuple(
-    offset
-    for deviation in range(0, 9)
-    for offset in ((0,) if deviation == 0 else (deviation, -deviation))
-)
+# Pickup is split into two explicit classes.  Every point on every fragment is
+# first tested at exact vertical.  Only a fragment with no vertical grasp uses
+# the competition fallback at the two +/-10 degree limits.
+PICK_CONTACT_FALLBACK_OFFSETS_DEG = (10.0, -10.0)
 # High pickup approach/retreat poses do not determine the contact point, so
 # they may use the documented KM1 downward working range.  Placement travel
 # and release remain strictly vertical.
 TRAVEL_FLATTEST_ALPHA_DEG = -25.0
 ALPHA_SEARCH_STEP_DEG = 1.0
-# One degree of contact tilt costs 0.75 mm in the grasp score.  This avoids
-# trading a well-balanced centroid grasp for a nearly vertical point at the
-# extreme fragment edge.
-CONTACT_TILT_SCORE_WEIGHT = 0.75
-
-
 def _rotation_matrix(angle_deg: float) -> np.ndarray:
     angle = math.radians(float(angle_deg))
     c, s = math.cos(angle), math.sin(angle)
@@ -119,9 +110,9 @@ def _select_pick_contact_pose(
     paper_point: np.ndarray,
     z_mm: float,
 ) -> tuple[tuple[int, ...], float] | None:
-    """Select one precomputed pickup pose inside the +/-8 degree window."""
+    """Select one extreme +/-10 degree pickup fallback pose."""
 
-    for offset_deg in PICK_CONTACT_ALPHA_OFFSETS_DEG:
+    for offset_deg in PICK_CONTACT_FALLBACK_OFFSETS_DEG:
         alpha_deg = VERTICAL_ALPHA_DEG + float(offset_deg)
         pwms = _pose_pwms(ik, paper_point, z_mm, alpha_deg)
         if pwms is not None:
@@ -138,13 +129,14 @@ def _select_reachable_grasp(
     travel_z_mm: float,
     grid_step_mm: float = 1.0,
 ) -> tuple[np.ndarray, float, float]:
-    """Choose an inset grasp, preferring a vertical contact pose."""
+    """Choose an inset grasp, exhausting vertical points before +/-10 degrees."""
 
     polygon = np.asarray(polygon_mm, dtype=np.float32)
     center = np.asarray(center_mm, dtype=np.float64)
     minimum = np.floor(np.min(polygon, axis=0))
     maximum = np.ceil(np.max(polygon, axis=0))
-    candidates: list[tuple[float, np.ndarray, float, float]] = []
+    vertical_candidates: list[tuple[float, np.ndarray, float, float]] = []
+    fallback_candidates: list[tuple[float, np.ndarray, float, float]] = []
 
     # A vertical centroid remains the best-balanced grasp and is accepted
     # immediately.  If it is not vertically reachable, include it in the
@@ -152,10 +144,11 @@ def _select_reachable_grasp(
     center_inset = float(
         cv2.pointPolygonTest(polygon, tuple(center.astype(float)), True)
     )
-    center_contact = _select_pick_contact_pose(
+    center_vertical_pwms = _pose_pwms(
         ik,
         center,
         pick_z_mm,
+        VERTICAL_ALPHA_DEG,
     )
     center_travel = _select_downward_pose(
         ik,
@@ -165,25 +158,30 @@ def _select_reachable_grasp(
     )
     if (
         center_inset >= 4.0
-        and center_contact is not None
-        and center_contact[1] == VERTICAL_ALPHA_DEG
+        and center_vertical_pwms is not None
         and center_travel is not None
     ):
-        return center.copy(), center_inset, center_contact[1]
+        return center.copy(), center_inset, VERTICAL_ALPHA_DEG
 
     if (
         center_inset >= 2.0
-        and center_contact is not None
         and center_travel is not None
     ):
-        center_tilt = abs(center_contact[1] - VERTICAL_ALPHA_DEG)
-        center_score = (
-            0.02 * center_inset
-            - CONTACT_TILT_SCORE_WEIGHT * center_tilt
-        )
-        candidates.append(
-            (center_score, center.copy(), center_inset, center_contact[1])
-        )
+        if center_vertical_pwms is not None:
+            vertical_candidates.append(
+                (0.02 * center_inset, center.copy(), center_inset, VERTICAL_ALPHA_DEG)
+            )
+        else:
+            center_fallback = _select_pick_contact_pose(ik, center, pick_z_mm)
+            if center_fallback is not None:
+                fallback_candidates.append(
+                    (
+                        0.02 * center_inset,
+                        center.copy(),
+                        center_inset,
+                        center_fallback[1],
+                    )
+                )
 
     x_values = np.arange(
         minimum[0],
@@ -207,13 +205,6 @@ def _select_reachable_grasp(
             )
             if inset < 2.0:
                 continue
-            contact_pose = _select_pick_contact_pose(
-                ik,
-                point,
-                pick_z_mm,
-            )
-            if contact_pose is None:
-                continue
             if _select_downward_pose(
                 ik,
                 point,
@@ -221,21 +212,31 @@ def _select_reachable_grasp(
                 flattest_alpha_deg=TRAVEL_FLATTEST_ALPHA_DEG,
             ) is None:
                 continue
-            # Contact pitch dominates the fallback score because a steeper
-            # magnet reduces lateral offset.  Distance to the contour centroid
-            # then keeps the steel fragment balanced under the 20 mm magnet.
-            contact_alpha = contact_pose[1]
-            contact_tilt = abs(contact_alpha - VERTICAL_ALPHA_DEG)
             score = (
                 -float(np.linalg.norm(point - center))
                 + 0.02 * inset
-                - CONTACT_TILT_SCORE_WEIGHT * contact_tilt
             )
-            candidates.append((score, point, inset, contact_alpha))
+            vertical_pwms = _pose_pwms(
+                ik,
+                point,
+                pick_z_mm,
+                VERTICAL_ALPHA_DEG,
+            )
+            if vertical_pwms is not None:
+                vertical_candidates.append(
+                    (score, point, inset, VERTICAL_ALPHA_DEG)
+                )
+                continue
+            fallback_pose = _select_pick_contact_pose(ik, point, pick_z_mm)
+            if fallback_pose is not None:
+                fallback_candidates.append(
+                    (score, point, inset, fallback_pose[1])
+                )
 
+    candidates = vertical_candidates or fallback_candidates
     if not candidates:
         raise RuntimeError(
-            "No downward-reachable point exists inside source polygon "
+            "No -90 or +/-10 degree pickup exists inside source polygon "
             f"{np.round(polygon, 2).tolist()}"
         )
     _, point, inset, contact_alpha = max(
@@ -256,7 +257,7 @@ def _select_reachable_layout_translation(
     min_pwm_margin_us: int,
     center_weight: float,
 ) -> tuple[np.ndarray, dict[int, dict[str, Any]]]:
-    """Find one rigid target-layout translation that is reachable for all pieces."""
+    """Find a translation that makes the largest possible subset reachable."""
 
     target_points = np.vstack(
         [np.asarray(draft["target_polygon"], dtype=np.float64) for draft in drafts]
@@ -303,6 +304,7 @@ def _select_reachable_layout_translation(
     x_values = np.arange(starts[0], stops[0] + 0.5 * step, step)
     y_values = np.arange(starts[1], stops[1] + 0.5 * step, step)
     best: tuple[
+        int,
         float,
         np.ndarray,
         dict[int, dict[str, Any]],
@@ -313,7 +315,6 @@ def _select_reachable_layout_translation(
             translation = np.asarray([shift_x, shift_y], dtype=np.float64)
             solved_by_piece: dict[int, dict[str, Any]] = {}
             pulse_margin = float("inf")
-            reachable = True
             for draft in drafts:
                 point = np.asarray(
                     draft["destination_grasp"],
@@ -330,14 +331,16 @@ def _select_reachable_layout_translation(
                     drop_z_mm,
                 )
                 if travel_pwms is None or drop_pwms is None:
-                    reachable = False
-                    break
-                for pwm in (*travel_pwms, *drop_pwms):
-                    pulse_margin = min(
-                        pulse_margin,
+                    continue
+                piece_pulse_margin = min(
+                    min(
                         float(pwm - PWM_MIN),
                         float(PWM_MAX - pwm),
                     )
+                    for pwm in (*travel_pwms, *drop_pwms)
+                )
+                if piece_pulse_margin < float(min_pwm_margin_us):
+                    continue
                 pick_robot_x, pick_robot_y = paper_to_robot(
                     *draft["source_grasp"]
                 )
@@ -364,15 +367,17 @@ def _select_reachable_layout_translation(
                     abs(pick_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
                     or abs(place_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
                 ):
-                    reachable = False
-                    break
+                    continue
                 for yaw_deg in (pick_tool_yaw_deg, place_tool_yaw_deg):
                     yaw_pwm = 1500.0 + (2000.0 / 270.0) * yaw_deg
-                    pulse_margin = min(
-                        pulse_margin,
+                    piece_pulse_margin = min(
+                        piece_pulse_margin,
                         yaw_pwm - PWM_MIN,
                         PWM_MAX - yaw_pwm,
                     )
+                if piece_pulse_margin < float(min_pwm_margin_us):
+                    continue
+                pulse_margin = min(pulse_margin, piece_pulse_margin)
                 solved_by_piece[int(draft["piece_id"])] = {
                     "place_travel": list(travel_pwms),
                     "place_drop": list(drop_pwms),
@@ -382,7 +387,7 @@ def _select_reachable_layout_translation(
                     "place_tool_yaw_deg": place_tool_yaw_deg,
                     "base_rotation_deg": base_rotation_deg,
                 }
-            if not reachable or pulse_margin < float(min_pwm_margin_us):
+            if not solved_by_piece:
                 continue
 
             shifted_minimum = minimum + translation
@@ -407,15 +412,15 @@ def _select_reachable_layout_translation(
                 + 2.0 * boundary_clearance
                 - float(center_weight) * center_distance
             )
-            if best is None or score > best[0]:
-                best = (score, translation, solved_by_piece)
+            reachable_count = len(solved_by_piece)
+            if best is None or (reachable_count, score) > (best[0], best[1]):
+                best = (reachable_count, score, translation, solved_by_piece)
 
     if best is None:
         raise RuntimeError(
-            "No common target translation is vertically reachable for every "
-            "piece inside the destination half"
+            "No destination pose is reachable for any piece inside the target half"
         )
-    return best[1], best[2]
+    return best[2], best[3]
 
 
 def build_vertical_control_plan(
@@ -432,7 +437,7 @@ def build_vertical_control_plan(
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """Build a complete, checked phase-aware tool-pose plan."""
+    """Build the largest checked phase-aware plan without all-or-nothing gating."""
 
     pieces = {
         int(piece["piece_id"]): piece for piece in envelope["pieces"]
@@ -453,19 +458,24 @@ def build_vertical_control_plan(
         float(grasp_validation_clearance_mm),
     )
     drafts: list[dict[str, Any]] = []
+    skipped_reasons: dict[int, str] = {}
 
     for piece_id in sequence:
         piece = pieces[piece_id]
         placement = placements[piece_id]
         source_center = np.asarray(piece["center_mm"], dtype=np.float64)
         source_polygon = np.asarray(piece["vertices_mm"], dtype=np.float64)
-        source_grasp, inset, pick_contact_alpha = _select_reachable_grasp(
-            source_polygon,
-            source_center,
-            ik,
-            pick_z_mm=pick_z,
-            travel_z_mm=grasp_validation_z,
-        )
+        try:
+            source_grasp, inset, pick_contact_alpha = _select_reachable_grasp(
+                source_polygon,
+                source_center,
+                ik,
+                pick_z_mm=pick_z,
+                travel_z_mm=grasp_validation_z,
+            )
+        except RuntimeError as error:
+            skipped_reasons[piece_id] = str(error)
+            continue
 
         rotation_delta = _normalise_angle(
             float(placement["rotation_delta_deg"])
@@ -498,11 +508,12 @@ def build_vertical_control_plan(
             pick_contact_alpha,
         )
         if pick_travel_pose is None or pick_contact_pwms is None:
-            raise RuntimeError(
+            skipped_reasons[piece_id] = (
                 f"Piece {piece_id} downward pickup poses are unreachable: "
                 f"paper={np.round(source_grasp, 2).tolist()}, "
                 f"pick_z={pick_z:.1f}, travel_z={travel_z:.1f}"
             )
+            continue
         pick_travel_pwms, pick_travel_alpha = pick_travel_pose
 
         drafts.append(
@@ -528,6 +539,25 @@ def build_vertical_control_plan(
             }
         )
 
+    if not drafts:
+        raise RuntimeError(
+            "No piece has a reachable pickup. "
+            + " | ".join(
+                f"P{piece_id}: {reason}"
+                for piece_id, reason in sorted(skipped_reasons.items())
+            )
+        )
+
+    # Exact-vertical pickups execute first.  The original vision sequence is
+    # retained inside each class, and +/-10 degree pieces follow afterwards.
+    drafts.sort(
+        key=lambda draft: (
+            abs(float(draft["pick_contact_alpha_deg"]) - VERTICAL_ALPHA_DEG)
+            > 1e-6,
+            sequence.index(int(draft["piece_id"])),
+        )
+    )
+
     layout_translation, place_pwms = _select_reachable_layout_translation(
         drafts,
         ik,
@@ -541,6 +571,9 @@ def build_vertical_control_plan(
     plan: list[dict[str, Any]] = []
     for draft in drafts:
         piece_id = int(draft["piece_id"])
+        if piece_id not in place_pwms:
+            skipped_reasons[piece_id] = "No reachable vertical placement pose"
+            continue
         destination_grasp = (
             np.asarray(draft["destination_grasp"]) + layout_translation
         )
@@ -612,6 +645,25 @@ def build_vertical_control_plan(
                 },
             }
         )
+    planned_piece_ids = [int(command["piece_id"]) for command in plan]
+    skipped_piece_ids = [
+        piece_id for piece_id in sequence if piece_id not in planned_piece_ids
+    ]
+    for command in plan:
+        command["total_piece_count"] = len(sequence)
+        command["planned_piece_count"] = len(plan)
+        command["skipped_piece_ids"] = skipped_piece_ids
+        command["skipped_reasons"] = {
+            str(piece_id): skipped_reasons.get(piece_id, "unreachable")
+            for piece_id in skipped_piece_ids
+        }
+        command["pickup_mode"] = (
+            "vertical_-90"
+            if abs(command["pick_contact_alpha_deg"] - VERTICAL_ALPHA_DEG) <= 1e-6
+            else "extreme_+/-10"
+        )
+    if not plan:
+        raise RuntimeError("No piece has both a reachable pickup and placement")
     return plan
 
 
@@ -630,7 +682,7 @@ def build_highest_vertical_control_plan(
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """Return the highest complete phase-aware plan for every piece."""
+    """Prefer all pieces, otherwise return the largest reachable subset."""
 
     maximum = float(max_travel_clearance_mm)
     minimum = float(min_travel_clearance_mm)
@@ -642,9 +694,11 @@ def build_highest_vertical_control_plan(
         clearances.append(minimum)
 
     errors: list[str] = []
+    best_partial: list[dict[str, Any]] | None = None
+    total_piece_count = len(envelope["pieces"])
     for clearance in clearances:
         try:
-            return build_vertical_control_plan(
+            plan = build_vertical_control_plan(
                 envelope,
                 ik,
                 paper_surface_z_mm=paper_surface_z_mm,
@@ -657,10 +711,16 @@ def build_highest_vertical_control_plan(
                 min_pwm_margin_us=min_pwm_margin_us,
                 layout_center_weight=layout_center_weight,
             )
+            if len(plan) >= total_piece_count:
+                return plan
+            if best_partial is None or len(plan) > len(best_partial):
+                best_partial = plan
         except RuntimeError as error:
             errors.append(f"{clearance:.1f} mm: {error}")
+    if best_partial:
+        return best_partial
     raise RuntimeError(
-        "No complete phase-aware plan is reachable between "
+        "No piece is reachable between "
         f"{minimum:.1f} and {maximum:.1f} mm. "
         + " | ".join(errors)
     )
