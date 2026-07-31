@@ -1,0 +1,9 @@
+{
+  "name": "e-puzzle-vision-tools",
+  "private": true,
+  "type": "module",
+  "description": "Optional Excel report builder dependencies",
+  "dependencies": {
+    "@oai/artifact-tool": ">=2.8.6"
+  }
+}

@@ -1,0 +1,18 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+
+# ROS 2 / colcon generated state
+build/
+install/
+log/
+
+# Runtime captures and diagnostic artifacts
+vertical_runs/
+vision_logs/
+puzzle_vision/outputs/
+puzzle_vision/vision_output/
+
+# Local dependency/cache directories
+puzzle_vision/node_modules/
