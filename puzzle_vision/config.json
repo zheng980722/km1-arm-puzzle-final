@@ -12,6 +12,8 @@
   "max_post_placement_overlap_mm2": 0.0,
   "paper_hsv_low": [45, 65, 150],
   "paper_hsv_high": [65, 160, 240],
+  "paper_detection_hsv_low": [44, 60, 140],
+  "paper_detection_hsv_high": [68, 175, 250],
   "background_lab_distance": 24.0,
   "border_ignore_mm": 3.0,
   "divider_ignore_mm": 2.5,

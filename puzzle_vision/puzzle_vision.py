@@ -180,9 +180,13 @@ class VisionConfig:
     max_allowed_vertex_gap_mm: float = 12.0
     max_post_placement_overlap_mm2: float = 0.0
 
-    # OpenCV HSV values (H uses [0, 179]).
+    # OpenCV HSV values (H uses [0, 179]).  Keep the segmentation range tight
+    # enough not to erase green/teal card artwork.  A4 localisation has its own
+    # wider range for competition lighting changes.
     paper_hsv_low: tuple[int, int, int] = (45, 65, 150)
     paper_hsv_high: tuple[int, int, int] = (65, 160, 240)
+    paper_detection_hsv_low: tuple[int, int, int] = (44, 60, 140)
+    paper_detection_hsv_high: tuple[int, int, int] = (68, 175, 250)
     background_lab_distance: float = 24.0
 
     border_ignore_mm: float = 2.0
@@ -437,87 +441,85 @@ def detect_a4_quad(image_bgr: np.ndarray, config: VisionConfig) -> np.ndarray:
     Robustness improvements:
     - convexHull before approxPolyDP (piece stickers can bite notches into
       the green mask contour, making it non-convex)
-    - Retry with a lower saturation floor when camera auto white balance
-      desaturates the green sheet after a reboot
+    - One mildly widened HSV range for changing competition lighting
     - Multiple epsilon values (0.02~0.10) tried sequentially
     - minAreaRect fallback when no valid 4-vertex polygon is found
     """
 
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    low = np.array(config.paper_hsv_low, dtype=np.uint8)
-    high = np.array(config.paper_hsv_high, dtype=np.uint8)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
 
     image_area = float(image_bgr.shape[0] * image_bgr.shape[1])
-    threshold_lows = [low]
-    if int(low[1]) > 30:
-        fallback_low = low.copy()
-        fallback_low[1] = 30
-        threshold_lows.append(fallback_low)
+    threshold_low = np.array(
+        config.paper_detection_hsv_low,
+        dtype=np.uint8,
+    )
+    threshold_high = np.array(
+        config.paper_detection_hsv_high,
+        dtype=np.uint8,
+    )
 
     expected_ratio = config.paper_width_mm / config.paper_height_mm
 
-    # Thresholds are tried in priority order.  Do not mix fallback contours
-    # with configured-threshold contours: on an uncompressed camera frame the
-    # low-saturation fallback can connect grey table pixels to the paper and
-    # win only because its incorrect hull is larger.
-    for threshold_low in threshold_lows:
-        mask = cv2.inRange(hsv, threshold_low, high)
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_CLOSE,
-            kernel,
-            iterations=2,
-        )
-        trial_contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        candidates: list[tuple[float, np.ndarray]] = []
-        for contour in trial_contours:
-            area = float(cv2.contourArea(contour))
-            if area < config.min_paper_area_ratio * image_area:
-                continue
+    # A single threshold pass avoids a second scene solve under the 120 s
+    # competition limit.  Polygon epsilon alternatives below operate on this
+    # same contour set and do not rerun colour segmentation.
+    mask = cv2.inRange(hsv, threshold_low, threshold_high)
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2,
+    )
+    trial_contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    candidates: list[tuple[float, np.ndarray]] = []
+    for contour in trial_contours:
+        area = float(cv2.contourArea(contour))
+        if area < config.min_paper_area_ratio * image_area:
+            continue
 
-            # Convex hull fills notches caused by piece stickers on the paper edge.
-            hull = cv2.convexHull(contour)
-            perimeter = cv2.arcLength(hull, True)
+        # Convex hull fills notches caused by piece stickers on the paper edge.
+        hull = cv2.convexHull(contour)
+        perimeter = cv2.arcLength(hull, True)
 
-            found_quad = None
-            for eps_factor in (0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10):
-                approx = cv2.approxPolyDP(
-                    hull,
-                    eps_factor * perimeter,
-                    True,
-                )
-                if len(approx) == 4 and cv2.isContourConvex(approx):
-                    found_quad = order_quad(approx.reshape(4, 2))
-                    break
+        found_quad = None
+        for eps_factor in (0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10):
+            approx = cv2.approxPolyDP(
+                hull,
+                eps_factor * perimeter,
+                True,
+            )
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                found_quad = order_quad(approx.reshape(4, 2))
+                break
 
-            if found_quad is None:
-                rect = cv2.minAreaRect(hull)
-                found_quad = order_quad(
-                    cv2.boxPoints(rect).astype(np.float32)
-                )
-
-            quad = found_quad
-            top = np.linalg.norm(quad[1] - quad[0])
-            bottom = np.linalg.norm(quad[2] - quad[3])
-            left = np.linalg.norm(quad[3] - quad[0])
-            right = np.linalg.norm(quad[2] - quad[1])
-            width = 0.5 * (top + bottom)
-            height = 0.5 * (left + right)
-            ratio = min(width, height) / max(width, height)
-            ratio_error = abs(ratio - expected_ratio)
-            if ratio_error > 0.20:
-                continue
-            candidates.append(
-                (area - ratio_error * image_area, quad)
+        if found_quad is None:
+            rect = cv2.minAreaRect(hull)
+            found_quad = order_quad(
+                cv2.boxPoints(rect).astype(np.float32)
             )
 
-        if candidates:
-            return max(candidates, key=lambda item: item[0])[1]
+        quad = found_quad
+        top = np.linalg.norm(quad[1] - quad[0])
+        bottom = np.linalg.norm(quad[2] - quad[3])
+        left = np.linalg.norm(quad[3] - quad[0])
+        right = np.linalg.norm(quad[2] - quad[1])
+        width = 0.5 * (top + bottom)
+        height = 0.5 * (left + right)
+        ratio = min(width, height) / max(width, height)
+        ratio_error = abs(ratio - expected_ratio)
+        if ratio_error > 0.20:
+            continue
+        candidates.append(
+            (area - ratio_error * image_area, quad)
+        )
+
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
 
     raise RuntimeError(
         "Unable to detect the coloured A4 sheet. Use --corners, adjust the HSV "
