@@ -12,10 +12,6 @@ from launch_ros.actions import Node
 def generate_launch_description():
     workspace = "/home/wheeltec/WorkSpace/km1_arm_ws"
     puzzle_vision = f"{workspace}/puzzle_vision"
-    placement_calibration = (
-        f"{workspace}/install/km1_arm/share/km1_arm/"
-        "config/placement_calibration.json"
-    )
     run_started_unix_s = float(time.time())
 
     start_serial = LaunchConfiguration("start_serial_driver")
@@ -38,10 +34,6 @@ def generate_launch_description():
                 default_value=f"{workspace}/vertical_runs",
             ),
             SetEnvironmentVariable("PUZZLE_VISION_PATH", puzzle_vision),
-            SetEnvironmentVariable(
-                "KM1_PLACEMENT_CALIBRATION_FILE",
-                placement_calibration,
-            ),
             Node(
                 package="km1_arm",
                 executable="serial_driver",
@@ -65,13 +57,8 @@ def generate_launch_description():
                 parameters=[
                     {
                         "enable_automatic_motion": enable_motion,
-                        # Paper is 30 mm above the floor while the robot base
-                        # board is 10 mm above it: robot-relative surface Z is
-                        # therefore 20 mm.
-                        "paper_surface_z_mm": 20.0,
-                        # Verified raised-fixture pickup height; keep fixed
-                        # while diagnosing the independent ID5 signal issue.
-                        "pick_clearance_mm": 30.0,
+                        "paper_surface_z_mm": 0.0,
+                        "pick_clearance_mm": 20.0,
                         "tool_length_mm": 50.0,
                         "travel_clearance_mm": 150.0,
                         "min_travel_clearance_mm": 70.0,
@@ -101,9 +88,7 @@ def generate_launch_description():
                         "auto_trigger": True,
                         "auto_trigger_delay_s": 7.0,
                         "run_started_unix_s": run_started_unix_s,
-                        # Geometry-only solving: card rank/suit/texture may
-                        # change at the competition site.
-                        "mode": "white",
+                        "mode": "auto",
                         "layout": "bench_right_to_left",
                         "config_json": f"{puzzle_vision}/config.json",
                         "diagnostic_dir": diagnostic_dir,

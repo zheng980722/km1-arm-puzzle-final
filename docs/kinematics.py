@@ -12,11 +12,12 @@ class Km1Kinematics:
     L2 = 88.0    # 小臂
     ORIGINAL_GRIPPER_L3 = 155.0
     MODIFIED_MAGNET_L3 = 50.0
-    # Loaded pick/place calibration for servo 0.  The overhead high-pose sweep
-    # suggested 7.80 us/deg, but a complete low-pose closed-loop run showed
-    # systematic over-rotation that consumed the planned piece clearance.
-    # Keep the anchored 7.0 us/deg value until the base is recalibrated at the
-    # real 25 mm placement posture under load.
+    # Real bench calibration of servo 0 on 2026-07-31.  Holding the arm at
+    # r=160 mm and z=180 mm gave approximately:
+    #   1500 us -> 0 deg, 1300 us -> 28 deg, 1250 us -> 35.5 deg.
+    # The original port effectively used 11.11 us/deg and therefore
+    # over-rotated large off-axis targets.  Keep this calibration separate
+    # from the generic 270-degree joint conversion used by servos 1..3.
     BASE_CENTER_PWM = 1500
     BASE_PWM_PER_DEG = 7.0
     VERTICAL_TOOL_ALPHA_DEG = -90.0
