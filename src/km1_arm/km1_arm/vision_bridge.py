@@ -54,6 +54,7 @@ class VisionBridge(Node):
         self.declare_parameter("auto_trigger_delay_s", 7.0)
         self.declare_parameter("run_started_unix_s", 0.0)
         self.declare_parameter("mode", "auto")
+        self.declare_parameter("competition_task", 2)
         self.declare_parameter("layout", "bench_right_to_left")
         self.declare_parameter("config_json", default_config)
         self.declare_parameter("diagnostic_dir", default_log_dir)
@@ -76,6 +77,11 @@ class VisionBridge(Node):
             configured_start if configured_start > 0.0 else time.time()
         )
         self.mode = str(self.get_parameter("mode").value)
+        self.competition_task = int(
+            self.get_parameter("competition_task").value
+        )
+        if self.competition_task not in (1, 2):
+            raise ValueError("competition_task must be 1 or 2")
         self.layout = str(self.get_parameter("layout").value)
         self.enable_control_output = bool(
             self.get_parameter("enable_control_output").value
@@ -113,6 +119,7 @@ class VisionBridge(Node):
 
         self.capture_lock = threading.Lock()
         self.final_capture_lock = threading.Lock()
+        self.event_capture_lock = threading.Lock()
         self.cap = None
         self.auto_triggered = False
         self.auto_timer = None
@@ -127,6 +134,7 @@ class VisionBridge(Node):
         self.get_logger().info(
             f"Vision bridge ready: camera={self.cam_idx}, "
             f"{self.camera_width}x{self.camera_height}@{self.camera_fps} MJPG, "
+            f"task={self.competition_task}, "
             f"layout={self.layout}, "
             f"control_output={state}"
         )
@@ -192,6 +200,7 @@ class VisionBridge(Node):
             result["reconstructed_texture"],
         )
         data = {
+            "competition_task": result["competition_task"],
             "scene_quality": result["scene_quality"],
             "vision_adaptation": result.get("vision_adaptation", {}),
             "pieces": [piece.to_summary() for piece in result["pieces"]],
@@ -227,7 +236,12 @@ class VisionBridge(Node):
             self.get_logger().info(
                 f"Captured {frame.shape[1]}x{frame.shape[0]}; running guarded pipeline"
             )
-            result = run_pipeline(frame, self.config, mode=self.mode)
+            result = run_pipeline(
+                frame,
+                self.config,
+                mode=self.mode,
+                competition_task=self.competition_task,
+            )
             self._save_success(run_dir, frame, result)
 
             plan = result.get("control_plan", [])
@@ -237,6 +251,7 @@ class VisionBridge(Node):
             status = {
                 "ok": True,
                 "published": self.enable_control_output,
+                "competition_task": self.competition_task,
                 "pieces": len(plan),
                 "scene_quality": result["scene_quality"],
                 "diagnostic_dir": str(run_dir),
@@ -255,6 +270,7 @@ class VisionBridge(Node):
                 "schema_version": 2,
                 "run_dir": str(run_dir),
                 "run_started_unix_s": self.run_started_unix_s,
+                "competition_task": self.competition_task,
                 "pixels_per_mm": float(self.config.pixels_per_mm),
                 "scene_quality": result["scene_quality"],
                 "pieces": [
@@ -280,6 +296,7 @@ class VisionBridge(Node):
                 {
                     "ok": False,
                     "published": False,
+                    "competition_task": self.competition_task,
                     "error": error,
                     "diagnostic_dir": str(run_dir),
                     "elapsed_s": round(
@@ -297,7 +314,26 @@ class VisionBridge(Node):
             status = json.loads(message.data)
         except json.JSONDecodeError:
             return
-        if status.get("event") != "all_done":
+        event = status.get("event")
+        if event in {"pick_attached", "place_released"}:
+            run_dir = status.get("run_dir")
+            if not run_dir:
+                self.get_logger().error(
+                    f"{event} status did not include run_dir"
+                )
+                return
+            threading.Thread(
+                target=self._capture_motion_event,
+                args=(
+                    Path(run_dir),
+                    int(status.get("piece_id", -1)),
+                    int(status.get("index", 0)),
+                    str(event),
+                ),
+                daemon=True,
+            ).start()
+            return
+        if event != "all_done":
             return
         run_dir = status.get("run_dir")
         if not run_dir:
@@ -308,6 +344,94 @@ class VisionBridge(Node):
             args=(Path(run_dir),),
             daemon=True,
         ).start()
+
+    def _capture_motion_event(
+        self,
+        run_dir: Path,
+        piece_id: int,
+        index: int,
+        phase: str,
+    ) -> None:
+        with self.event_capture_lock:
+            try:
+                with self.capture_lock:
+                    frame = self._capture_median()
+
+                phase_offset = 0 if phase == "pick_attached" else 1
+                artifact_number = 18 + 2 * index + phase_offset
+                stem = (
+                    f"{artifact_number:02d}_step{index:02d}_p{piece_id}_"
+                    f"{phase}"
+                )
+                full_path = run_dir / f"{stem}.jpg"
+                cv2.imwrite(str(full_path), frame)
+
+                try:
+                    rectified, _ = rectify_a4(frame, self.config)
+                    cv2.imwrite(
+                        str(run_dir / f"{stem}_rectified.jpg"),
+                        rectified,
+                    )
+                except Exception as error:
+                    self.get_logger().warning(
+                        f"P{piece_id} {phase} rectification skipped: {error}"
+                    )
+
+                comparison_path = None
+                if phase == "place_released":
+                    pick_number = 18 + 2 * index
+                    pick_path = run_dir / (
+                        f"{pick_number:02d}_step{index:02d}_p{piece_id}_"
+                        "pick_attached.jpg"
+                    )
+                    pick_frame = cv2.imread(str(pick_path))
+                    if pick_frame is not None:
+                        if pick_frame.shape[:2] != frame.shape[:2]:
+                            pick_frame = cv2.resize(
+                                pick_frame,
+                                (frame.shape[1], frame.shape[0]),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        comparison = np.hstack(
+                            [
+                                self._label_panel(
+                                    pick_frame,
+                                    f"P{piece_id} PICK ATTACHED",
+                                ),
+                                self._label_panel(
+                                    frame,
+                                    f"P{piece_id} PLACE RELEASED",
+                                ),
+                            ]
+                        )
+                        comparison_path = run_dir / (
+                            f"{artifact_number:02d}_step{index:02d}_p{piece_id}_"
+                            "pick_vs_place.jpg"
+                        )
+                        cv2.imwrite(str(comparison_path), comparison)
+
+                self._publish_status(
+                    {
+                        "ok": True,
+                        "event": "motion_capture_ready",
+                        "phase": phase,
+                        "piece_id": piece_id,
+                        "index": index,
+                        "image": str(full_path),
+                        "comparison": (
+                            str(comparison_path)
+                            if comparison_path is not None
+                            else None
+                        ),
+                    }
+                )
+                self.get_logger().info(
+                    f"Saved P{piece_id} {phase} capture: {full_path.name}"
+                )
+            except Exception as error:
+                self.get_logger().error(
+                    f"P{piece_id} {phase} capture failed: {error}"
+                )
 
     @staticmethod
     def _label_panel(image: np.ndarray, text: str) -> np.ndarray:

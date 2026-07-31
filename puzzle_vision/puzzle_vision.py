@@ -100,6 +100,43 @@ def simplify_polygon_vertices(
     return np.asarray(polygon, dtype=np.float64)
 
 
+def collapse_short_polygon_edges(
+    points: np.ndarray,
+    *,
+    min_edge_mm: float,
+) -> np.ndarray:
+    """Collapse fitted contour edges shorter than the task-2 noise threshold.
+
+    The on-site fragments have no real edge below 20 mm. Camera contours can
+    nevertheless split one physical corner into a tiny bevel. Merging only
+    edges below 10 mm removes those false vertices while deliberately avoiding
+    a hard 20 mm rejection, because calibration and segmentation error can
+    make a legal edge measure slightly short.
+    """
+
+    polygon = [np.asarray(point, dtype=np.float64) for point in points]
+    threshold = max(0.0, float(min_edge_mm))
+    while threshold > 0.0 and len(polygon) > 3:
+        edge_lengths = [
+            float(np.linalg.norm(polygon[(index + 1) % len(polygon)] - point))
+            for index, point in enumerate(polygon)
+        ]
+        edge_index = int(np.argmin(edge_lengths))
+        if edge_lengths[edge_index] >= threshold:
+            break
+
+        next_index = (edge_index + 1) % len(polygon)
+        midpoint = 0.5 * (polygon[edge_index] + polygon[next_index])
+        if next_index == 0:
+            polygon[0] = midpoint
+            polygon.pop(edge_index)
+        else:
+            polygon[edge_index] = midpoint
+            polygon.pop(next_index)
+
+    return np.asarray(polygon, dtype=np.float64)
+
+
 def transform_points(points: np.ndarray, angle_deg: float, translation: np.ndarray) -> np.ndarray:
     return points @ rotation_matrix(angle_deg).T + np.asarray(translation, dtype=np.float64)
 
@@ -154,6 +191,15 @@ class VisionConfig:
     min_piece_count: int = 2
     max_piece_count: int = 4
     max_piece_vertices: int = 5
+    short_edge_prune_mm: float = 0.0
+    minimum_valid_edge_mm: float = 0.0
+    task1_short_edge_prune_mm: float = 5.0
+    task1_minimum_valid_edge_mm: float = 5.0
+    task1_search_overlap_tolerance_mm2: float = 25.0
+    task1_target_vertex_gap_mm: float = 7.0
+    task2_short_edge_prune_mm: float = 10.0
+    task2_search_overlap_tolerance_mm2: float = 25.0
+    task2_target_vertex_gap_mm: float = 7.0
     polygon_epsilon_mm: float = 0.5
     low_resolution_polygon_epsilon_mm: float = 5.0
     low_resolution_paper_short_edge_px: float = 400.0
@@ -674,6 +720,23 @@ def _piece_from_contour(
         raise RuntimeError(f"Piece {piece_id} has fewer than three polygon vertices.")
 
     polygon_mm = simplify_polygon_vertices(approx / scale)
+    if config.short_edge_prune_mm > 0.0:
+        polygon_mm = collapse_short_polygon_edges(
+            polygon_mm,
+            min_edge_mm=config.short_edge_prune_mm,
+        )
+        polygon_mm = simplify_polygon_vertices(polygon_mm)
+    if config.minimum_valid_edge_mm > 0.0:
+        fitted_edge_lengths = np.linalg.norm(
+            np.roll(polygon_mm, -1, axis=0) - polygon_mm,
+            axis=1,
+        )
+        shortest_edge_mm = float(np.min(fitted_edge_lengths))
+        if shortest_edge_mm < config.minimum_valid_edge_mm:
+            raise RuntimeError(
+                f"Piece {piece_id} shortest fitted edge {shortest_edge_mm:.2f} mm "
+                f"is below the task minimum {config.minimum_valid_edge_mm:.2f} mm."
+            )
     polygon_mm = ensure_consistent_winding(polygon_mm)
     local_polygon_mm = polygon_mm - center_mm
     orientation_deg = pca_orientation_deg(polygon_mm)
@@ -2163,9 +2226,35 @@ def run_pipeline(
     config: VisionConfig,
     *,
     mode: str = "auto",
+    competition_task: int = 2,
     corners: Optional[np.ndarray] = None,
     already_rectified: bool = False,
 ) -> dict[str, Any]:
+    if competition_task not in (1, 2):
+        raise ValueError("competition_task must be 1 or 2")
+
+    # Task 1 uses the fixed self-provided pieces from Figure 2, which include
+    # a 10 mm boundary segment. Its 5 mm threshold leaves a 2x measurement
+    # margin and is enforced after cleanup. Task 2 uses random on-site
+    # fragments whose physical edges are all at least 20 mm, so sub-10 mm
+    # fitted edges are contour noise and may be merged safely. Do not enforce
+    # a measured 20 mm minimum: calibration error can shorten a legal edge.
+    config = replace(config)
+    if competition_task == 1:
+        config.short_edge_prune_mm = config.task1_short_edge_prune_mm
+        config.minimum_valid_edge_mm = config.task1_minimum_valid_edge_mm
+        config.overlap_tolerance_mm2 = (
+            config.task1_search_overlap_tolerance_mm2
+        )
+        config.target_vertex_gap_mm = config.task1_target_vertex_gap_mm
+    else:
+        config.short_edge_prune_mm = config.task2_short_edge_prune_mm
+        config.minimum_valid_edge_mm = 0.0
+        config.overlap_tolerance_mm2 = (
+            config.task2_search_overlap_tolerance_mm2
+        )
+        config.target_vertex_gap_mm = config.task2_target_vertex_gap_mm
+
     # Detect corners explicitly for debug output
     if already_rectified:
         detected_corners = None
@@ -2268,6 +2357,7 @@ def run_pipeline(
             )
 
     return {
+        "competition_task": competition_task,
         "rectified": rectified,
         "segmentation_mask": segmentation_mask,
         "green_mask": green_mask,
@@ -2289,6 +2379,10 @@ def run_pipeline(
         "vision_adaptation": {
             "selected_attempt": selected_attempt,
             "border_ignore_mm": frame_config.border_ignore_mm,
+            "short_edge_prune_mm": frame_config.short_edge_prune_mm,
+            "minimum_valid_edge_mm": frame_config.minimum_valid_edge_mm,
+            "search_overlap_tolerance_mm2": frame_config.overlap_tolerance_mm2,
+            "target_vertex_gap_mm": frame_config.target_vertex_gap_mm,
             "attempt_errors": attempt_errors,
         },
         "pieces": pieces,

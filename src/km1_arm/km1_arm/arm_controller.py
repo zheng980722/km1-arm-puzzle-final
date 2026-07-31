@@ -63,6 +63,7 @@ class ArmController(Node):
         self.declare_parameter("max_run_time_s", 120.0)
         self.declare_parameter("move_time_ms", 1000)
         self.declare_parameter("magnet_dwell_ms", 350)
+        self.declare_parameter("event_capture_hold_s", 0.75)
 
         self.enable_automatic_motion = bool(
             self.get_parameter("enable_automatic_motion").value
@@ -104,6 +105,10 @@ class ArmController(Node):
         self.magnet_dwell_ms = int(
             self.get_parameter("magnet_dwell_ms").value
         )
+        self.event_capture_hold_s = max(
+            0.0,
+            float(self.get_parameter("event_capture_hold_s").value),
+        )
         self.ik = Km1Kinematics(
             tool_length_mm=float(
                 self.get_parameter("tool_length_mm").value
@@ -135,7 +140,8 @@ class ArmController(Node):
             f"automatic_motion={state}, "
             f"surface_z={self.paper_surface_z_mm:.1f} mm, "
             f"travel={self.travel_clearance_mm:.1f} mm, "
-            f"drop={self.drop_clearance_mm:.1f} mm"
+            f"drop={self.drop_clearance_mm:.1f} mm, "
+            f"capture_hold={self.event_capture_hold_s:.2f} s"
         )
 
     def _publish_status(self, payload: dict) -> None:
@@ -291,6 +297,17 @@ class ArmController(Node):
                 self._wait_move()
                 self.magnet_on()
                 time.sleep(self.magnet_dwell_ms / 1000.0)
+                self._publish_status(
+                    {
+                        "event": "pick_attached",
+                        "run_dir": run_dir,
+                        "piece_id": piece_id,
+                        "index": index + 1,
+                        "count": len(plan),
+                    }
+                )
+                record("pick_attached", piece_id=piece_id)
+                time.sleep(self.event_capture_hold_s)
                 self.move_xyz_vertical(
                     pick_x,
                     pick_y,
@@ -321,6 +338,17 @@ class ArmController(Node):
                 self._wait_move()
                 self.magnet_off()
                 time.sleep(self.magnet_dwell_ms / 1000.0)
+                self._publish_status(
+                    {
+                        "event": "place_released",
+                        "run_dir": run_dir,
+                        "piece_id": piece_id,
+                        "index": index + 1,
+                        "count": len(plan),
+                    }
+                )
+                record("place_released", piece_id=piece_id)
+                time.sleep(self.event_capture_hold_s)
                 self.move_xyz_vertical(
                     place_x,
                     place_y,

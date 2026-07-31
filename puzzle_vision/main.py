@@ -72,6 +72,7 @@ def serialise_result(result: dict, config: VisionConfig) -> dict:
     solution = result["solution"]
     pieces = result["pieces"]
     return {
+        "competition_task": result["competition_task"],
         "config": {
             "paper_width_mm": config.paper_width_mm,
             "paper_height_mm": config.paper_height_mm,
@@ -113,6 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Puzzle mode; auto classifies from colour and texture",
     )
     parser.add_argument(
+        "--competition-task",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="1=fixed self-provided fragments, 2=random on-site fragments",
+    )
+    parser.add_argument(
         "--rectified",
         action="store_true",
         help="Input image is already a top-down A4 image",
@@ -148,6 +156,7 @@ def main() -> int:
         frame,
         config,
         mode=args.mode,
+        competition_task=args.competition_task,
         corners=corners,
         already_rectified=args.rectified,
     )

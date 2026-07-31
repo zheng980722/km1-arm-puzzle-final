@@ -7,6 +7,7 @@ from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -17,6 +18,7 @@ def generate_launch_description():
     start_serial = LaunchConfiguration("start_serial_driver")
     enable_motion = LaunchConfiguration("enable_motion")
     camera_index = LaunchConfiguration("camera_index")
+    competition_task = LaunchConfiguration("competition_task")
     serial_port = LaunchConfiguration("serial_port")
     diagnostic_dir = LaunchConfiguration("diagnostic_dir")
 
@@ -25,6 +27,7 @@ def generate_launch_description():
             DeclareLaunchArgument("start_serial_driver", default_value="true"),
             DeclareLaunchArgument("enable_motion", default_value="true"),
             DeclareLaunchArgument("camera_index", default_value="0"),
+            DeclareLaunchArgument("competition_task", default_value="2"),
             DeclareLaunchArgument(
                 "serial_port",
                 default_value="/dev/ttyCH341USB0",
@@ -73,6 +76,7 @@ def generate_launch_description():
                         "max_run_time_s": 120.0,
                         "move_time_ms": 1000,
                         "magnet_dwell_ms": 350,
+                        "event_capture_hold_s": 0.75,
                     }
                 ],
             ),
@@ -91,6 +95,10 @@ def generate_launch_description():
                         "auto_trigger_delay_s": 7.0,
                         "run_started_unix_s": run_started_unix_s,
                         "mode": "auto",
+                        "competition_task": ParameterValue(
+                            competition_task,
+                            value_type=int,
+                        ),
                         "layout": "bench_right_to_left",
                         "config_json": f"{puzzle_vision}/config.json",
                         "diagnostic_dir": diagnostic_dir,
