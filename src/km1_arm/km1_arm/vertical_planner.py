@@ -34,6 +34,23 @@ DEFAULT_LAYOUT_EDGE_MARGIN_MM = 2.0
 DEFAULT_LAYOUT_SEARCH_STEP_MM = 1.0
 DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
+VERTICAL_ALPHA_DEG = -90.0
+# Pickup contact may deviate by at most +/-8 degrees from vertical.  The order
+# is deliberate: exact vertical first, then the smallest symmetric deviation.
+PICK_CONTACT_ALPHA_OFFSETS_DEG = tuple(
+    offset
+    for deviation in range(0, 9)
+    for offset in ((0,) if deviation == 0 else (deviation, -deviation))
+)
+# High pickup approach/retreat poses do not determine the contact point, so
+# they may use the documented KM1 downward working range.  Placement travel
+# and release remain strictly vertical.
+TRAVEL_FLATTEST_ALPHA_DEG = -25.0
+ALPHA_SEARCH_STEP_DEG = 1.0
+# One degree of contact tilt costs 0.75 mm in the grasp score.  This avoids
+# trading a well-balanced centroid grasp for a nearly vertical point at the
+# extreme fragment edge.
+CONTACT_TILT_SCORE_WEIGHT = 0.75
 
 
 def _rotation_matrix(angle_deg: float) -> np.ndarray:
@@ -46,14 +63,69 @@ def _normalise_angle(angle_deg: float) -> float:
     return (float(angle_deg) + 180.0) % 360.0 - 180.0
 
 
-def _vertical_pwms(ik, paper_point: np.ndarray, z_mm: float):
+def _pose_pwms(
+    ik,
+    paper_point: np.ndarray,
+    z_mm: float,
+    alpha_deg: float,
+):
     robot_x, robot_y = paper_to_robot(*paper_point)
-    pwms = ik.solve_vertical(robot_x, robot_y, z_mm)
+    pwms = ik.solve(robot_x, robot_y, z_mm, float(alpha_deg))
     if pwms is None:
         return None
     if any(pwm < PWM_MIN or pwm > PWM_MAX for pwm in pwms):
         return None
     return tuple(int(pwm) for pwm in pwms)
+
+
+def _vertical_pwms(ik, paper_point: np.ndarray, z_mm: float):
+    return _pose_pwms(ik, paper_point, z_mm, VERTICAL_ALPHA_DEG)
+
+
+def _select_downward_pose(
+    ik,
+    paper_point: np.ndarray,
+    z_mm: float,
+    *,
+    flattest_alpha_deg: float,
+) -> tuple[tuple[int, ...], float] | None:
+    """Return the steepest downward pose that reaches one paper point.
+
+    Candidates start at -90 degrees, so a vertical magnet is always selected
+    when possible.  Progressively flatter poses are considered only when the
+    previous pose has no valid IK solution.
+    """
+
+    flattest = min(
+        -1.0,
+        max(VERTICAL_ALPHA_DEG, float(flattest_alpha_deg)),
+    )
+    step = max(0.5, float(ALPHA_SEARCH_STEP_DEG))
+    candidates = list(
+        np.arange(VERTICAL_ALPHA_DEG, flattest + 0.5 * step, step)
+    )
+    if not candidates or candidates[-1] < flattest - 1e-6:
+        candidates.append(flattest)
+    for alpha_deg in candidates:
+        pwms = _pose_pwms(ik, paper_point, z_mm, float(alpha_deg))
+        if pwms is not None:
+            return pwms, float(alpha_deg)
+    return None
+
+
+def _select_pick_contact_pose(
+    ik,
+    paper_point: np.ndarray,
+    z_mm: float,
+) -> tuple[tuple[int, ...], float] | None:
+    """Select one precomputed pickup pose inside the +/-8 degree window."""
+
+    for offset_deg in PICK_CONTACT_ALPHA_OFFSETS_DEG:
+        alpha_deg = VERTICAL_ALPHA_DEG + float(offset_deg)
+        pwms = _pose_pwms(ik, paper_point, z_mm, alpha_deg)
+        if pwms is not None:
+            return pwms, alpha_deg
+    return None
 
 
 def _select_reachable_grasp(
@@ -64,27 +136,53 @@ def _select_reachable_grasp(
     pick_z_mm: float,
     travel_z_mm: float,
     grid_step_mm: float = 1.0,
-) -> tuple[np.ndarray, float]:
-    """Choose the deepest reachable point inside a source polygon."""
+) -> tuple[np.ndarray, float, float]:
+    """Choose an inset grasp, preferring a vertical contact pose."""
 
     polygon = np.asarray(polygon_mm, dtype=np.float32)
     center = np.asarray(center_mm, dtype=np.float64)
     minimum = np.floor(np.min(polygon, axis=0))
     maximum = np.ceil(np.max(polygon, axis=0))
-    candidates: list[tuple[float, np.ndarray, float]] = []
+    candidates: list[tuple[float, np.ndarray, float, float]] = []
 
-    # The contour-area centroid best balances a thin steel fragment under the
-    # circular magnet.  Once it has at least 4 mm of contour clearance, keep it
-    # instead of moving far away merely to gain a few millimetres of inset.
+    # A vertical centroid remains the best-balanced grasp and is accepted
+    # immediately.  If it is not vertically reachable, include it in the
+    # fallback search so nearby, steeper contact poses can win.
     center_inset = float(
         cv2.pointPolygonTest(polygon, tuple(center.astype(float)), True)
     )
+    center_contact = _select_pick_contact_pose(
+        ik,
+        center,
+        pick_z_mm,
+    )
+    center_travel = _select_downward_pose(
+        ik,
+        center,
+        travel_z_mm,
+        flattest_alpha_deg=TRAVEL_FLATTEST_ALPHA_DEG,
+    )
     if (
         center_inset >= 4.0
-        and _vertical_pwms(ik, center, pick_z_mm) is not None
-        and _vertical_pwms(ik, center, travel_z_mm) is not None
+        and center_contact is not None
+        and center_contact[1] == VERTICAL_ALPHA_DEG
+        and center_travel is not None
     ):
-        return center.copy(), center_inset
+        return center.copy(), center_inset, center_contact[1]
+
+    if (
+        center_inset >= 2.0
+        and center_contact is not None
+        and center_travel is not None
+    ):
+        center_tilt = abs(center_contact[1] - VERTICAL_ALPHA_DEG)
+        center_score = (
+            0.02 * center_inset
+            - CONTACT_TILT_SCORE_WEIGHT * center_tilt
+        )
+        candidates.append(
+            (center_score, center.copy(), center_inset, center_contact[1])
+        )
 
     x_values = np.arange(
         minimum[0],
@@ -108,28 +206,42 @@ def _select_reachable_grasp(
             )
             if inset < 2.0:
                 continue
-            if _vertical_pwms(ik, point, pick_z_mm) is None:
+            contact_pose = _select_pick_contact_pose(
+                ik,
+                point,
+                pick_z_mm,
+            )
+            if contact_pose is None:
                 continue
-            if _vertical_pwms(ik, point, travel_z_mm) is None:
+            if _select_downward_pose(
+                ik,
+                point,
+                travel_z_mm,
+                flattest_alpha_deg=TRAVEL_FLATTEST_ALPHA_DEG,
+            ) is None:
                 continue
-            # Maximise steel coverage under the 20 mm radius magnet, then
-            # mildly prefer the vision centroid when inset is comparable.
-            # Fallback is used only when the exact centroid is unreachable.
-            # Keep the point as close as possible to the centroid while
-            # retaining at least 2 mm of contour clearance.
+            # Contact pitch dominates the fallback score because a steeper
+            # magnet reduces lateral offset.  Distance to the contour centroid
+            # then keeps the steel fragment balanced under the 20 mm magnet.
+            contact_alpha = contact_pose[1]
+            contact_tilt = abs(contact_alpha - VERTICAL_ALPHA_DEG)
             score = (
                 -float(np.linalg.norm(point - center))
                 + 0.02 * inset
+                - CONTACT_TILT_SCORE_WEIGHT * contact_tilt
             )
-            candidates.append((score, point, inset))
+            candidates.append((score, point, inset, contact_alpha))
 
     if not candidates:
         raise RuntimeError(
-            "No vertically reachable point exists inside source polygon "
+            "No downward-reachable point exists inside source polygon "
             f"{np.round(polygon, 2).tolist()}"
         )
-    _, point, inset = max(candidates, key=lambda item: item[0])
-    return point, float(inset)
+    _, point, inset, contact_alpha = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+    return point, float(inset), float(contact_alpha)
 
 
 def _select_reachable_layout_translation(
@@ -258,6 +370,8 @@ def _select_reachable_layout_translation(
                 solved_by_piece[int(draft["piece_id"])] = {
                     "place_travel": list(travel_pwms),
                     "place_drop": list(drop_pwms),
+                    "place_travel_alpha_deg": VERTICAL_ALPHA_DEG,
+                    "place_drop_alpha_deg": VERTICAL_ALPHA_DEG,
                     "pick_tool_yaw_deg": pick_tool_yaw_deg,
                     "place_tool_yaw_deg": place_tool_yaw_deg,
                     "base_rotation_deg": base_rotation_deg,
@@ -312,7 +426,7 @@ def build_vertical_control_plan(
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """Build a complete, checked vertical-tool plan from a vision envelope."""
+    """Build a complete, checked phase-aware tool-pose plan."""
 
     pieces = {
         int(piece["piece_id"]): piece for piece in envelope["pieces"]
@@ -339,7 +453,7 @@ def build_vertical_control_plan(
         placement = placements[piece_id]
         source_center = np.asarray(piece["center_mm"], dtype=np.float64)
         source_polygon = np.asarray(piece["vertices_mm"], dtype=np.float64)
-        source_grasp, inset = _select_reachable_grasp(
+        source_grasp, inset, pick_contact_alpha = _select_reachable_grasp(
             source_polygon,
             source_center,
             ik,
@@ -365,19 +479,25 @@ def build_vertical_control_plan(
             + _rotation_matrix(rotation_delta)
             @ (source_grasp - source_center)
         )
-        solved_pick: dict[str, list[int]] = {}
-        for name, z_mm in (
-            ("pick_travel", travel_z),
-            ("pick_contact", pick_z),
-        ):
-            point = source_grasp
-            pwms = _vertical_pwms(ik, point, z_mm)
-            if pwms is None:
-                raise RuntimeError(
-                    f"Piece {piece_id} vertical pose {name} is unreachable: "
-                    f"paper={np.round(point, 2).tolist()}, z={z_mm:.1f}"
-                )
-            solved_pick[name] = list(pwms)
+        pick_travel_pose = _select_downward_pose(
+            ik,
+            source_grasp,
+            travel_z,
+            flattest_alpha_deg=TRAVEL_FLATTEST_ALPHA_DEG,
+        )
+        pick_contact_pwms = _pose_pwms(
+            ik,
+            source_grasp,
+            pick_z,
+            pick_contact_alpha,
+        )
+        if pick_travel_pose is None or pick_contact_pwms is None:
+            raise RuntimeError(
+                f"Piece {piece_id} downward pickup poses are unreachable: "
+                f"paper={np.round(source_grasp, 2).tolist()}, "
+                f"pick_z={pick_z:.1f}, travel_z={travel_z:.1f}"
+            )
+        pick_travel_pwms, pick_travel_alpha = pick_travel_pose
 
         drafts.append(
             {
@@ -393,7 +513,12 @@ def build_vertical_control_plan(
                 ),
                 "grasp_inset_mm": inset,
                 "rotation_delta_deg": rotation_delta,
-                "pick_pwms": solved_pick,
+                "pick_pwms": {
+                    "pick_travel": list(pick_travel_pwms),
+                    "pick_contact": list(pick_contact_pwms),
+                },
+                "pick_contact_alpha_deg": pick_contact_alpha,
+                "pick_travel_alpha_deg": pick_travel_alpha,
             }
         )
 
@@ -450,10 +575,30 @@ def build_vertical_control_plan(
                     float(place_pwms[piece_id]["base_rotation_deg"]),
                     3,
                 ),
+                "pick_travel_alpha_deg": round(
+                    float(draft["pick_travel_alpha_deg"]),
+                    3,
+                ),
+                "pick_contact_alpha_deg": round(
+                    float(draft["pick_contact_alpha_deg"]),
+                    3,
+                ),
+                "place_travel_alpha_deg": round(
+                    float(
+                        place_pwms[piece_id]["place_travel_alpha_deg"]
+                    ),
+                    3,
+                ),
+                "place_drop_alpha_deg": round(
+                    float(place_pwms[piece_id]["place_drop_alpha_deg"]),
+                    3,
+                ),
                 "pick_z_mm": pick_z,
                 "travel_z_mm": travel_z,
                 "drop_z_mm": drop_z,
-                "vertical_alpha_deg": -90.0,
+                # Retained for old artifact readers.  Per-phase fields above
+                # are authoritative for execution.
+                "vertical_alpha_deg": VERTICAL_ALPHA_DEG,
                 "pwms": {
                     **draft["pick_pwms"],
                     "place_travel": place_pwms[piece_id]["place_travel"],
@@ -479,7 +624,7 @@ def build_highest_vertical_control_plan(
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """Return the highest complete plan reachable by every pick and place pose."""
+    """Return the highest complete phase-aware plan for every piece."""
 
     maximum = float(max_travel_clearance_mm)
     minimum = float(min_travel_clearance_mm)
@@ -509,7 +654,7 @@ def build_highest_vertical_control_plan(
         except RuntimeError as error:
             errors.append(f"{clearance:.1f} mm: {error}")
     raise RuntimeError(
-        "No complete vertical plan is reachable between "
+        "No complete phase-aware plan is reachable between "
         f"{minimum:.1f} and {maximum:.1f} mm. "
         + " | ".join(errors)
     )

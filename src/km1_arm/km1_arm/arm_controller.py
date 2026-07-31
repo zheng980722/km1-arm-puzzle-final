@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""KM1 vertical-electromagnet pick/place controller.
+"""KM1 phase-aware electromagnet pick/place controller.
 
 Production data flow:
 
     vision_bridge -> /km1/control_plan -> this node -> serial_driver
 
 The controller accepts only the complete schema-v2 vision envelope.  It
-chooses reachable grasp points from the detected polygons, constrains the
-electromagnet axis to vertical, performs all XY travel at a clearance height,
-and releases 10 mm above the paper without mechanical contact.
+chooses reachable grasp points from the detected polygons, keeps pickup and
+release vertical whenever IK permits, allows the minimum necessary pitch at
+far-edge poses, and performs XY travel at a clearance height.
 """
 
 from __future__ import annotations
@@ -263,21 +263,37 @@ class ArmController(Node):
                 pick_z = float(command["pick_z_mm"])
                 travel_z = float(command["travel_z_mm"])
                 drop_z = float(command["drop_z_mm"])
+                pick_travel_alpha = float(
+                    command.get("pick_travel_alpha_deg", -90.0)
+                )
+                pick_contact_alpha = float(
+                    command.get("pick_contact_alpha_deg", -90.0)
+                )
+                place_travel_alpha = float(
+                    command.get("place_travel_alpha_deg", -90.0)
+                )
+                place_drop_alpha = float(
+                    command.get("place_drop_alpha_deg", -90.0)
+                )
 
                 self.get_logger().info(
                     f"P{piece_id} ({index + 1}/{len(plan)}): "
                     f"pick={pick}, place={place}, "
                     f"inset={command['grasp_inset_mm']:.1f} mm, "
                     f"piece_yaw={rotation:.1f} deg, "
-                    f"tool={pick_tool_yaw:.1f}->{place_tool_yaw:.1f} deg"
+                    f"tool={pick_tool_yaw:.1f}->{place_tool_yaw:.1f} deg, "
+                    f"pitch=({pick_travel_alpha:.1f},"
+                    f"{pick_contact_alpha:.1f})->"
+                    f"({place_travel_alpha:.1f},"
+                    f"{place_drop_alpha:.1f}) deg"
                 )
 
-                # PICK: vertical tool, no XY movement below travel height.
+                # PICK: use the steepest reachable pitch.  The planner keeps
+                # contact vertical unless the real far-edge workspace needs a
+                # small tilt, as confirmed by manual pickup.
                 self.rotate_tool(0.0, 500)
-                self.move_xyz_vertical(
-                    pick_x,
-                    pick_y,
-                    travel_z,
+                self.move_precomputed_pwms(
+                    command["pwms"]["pick_travel"],
                     self.move_time_ms,
                 )
                 self._wait_move()
@@ -288,10 +304,8 @@ class ArmController(Node):
                 # tool reaches the vision-derived grasp point, shifting its
                 # effective centroid.
                 self.magnet_off()
-                self.move_xyz_vertical(
-                    pick_x,
-                    pick_y,
-                    pick_z,
+                self.move_precomputed_pwms(
+                    command["pwms"]["pick_contact"],
                     self.move_time_ms,
                 )
                 self._wait_move()
@@ -308,10 +322,8 @@ class ArmController(Node):
                 )
                 record("pick_attached", piece_id=piece_id)
                 time.sleep(self.event_capture_hold_s)
-                self.move_xyz_vertical(
-                    pick_x,
-                    pick_y,
-                    travel_z,
+                self.move_precomputed_pwms(
+                    command["pwms"]["pick_travel"],
                     self.move_time_ms,
                 )
                 self._wait_move()
@@ -320,19 +332,15 @@ class ArmController(Node):
                 self.rotate_tool(place_tool_yaw, self.move_time_ms)
                 self._wait_move()
 
-                # PLACE: vertical approach, stop 10 mm above paper, then
-                # disable the magnet so the piece falls freely.
-                self.move_xyz_vertical(
-                    place_x,
-                    place_y,
-                    travel_z,
+                # PLACE: both high travel and release remain vertical.  The
+                # +/-8 degree fallback is exclusive to pickup contact.
+                self.move_precomputed_pwms(
+                    command["pwms"]["place_travel"],
                     self.move_time_ms,
                 )
                 self._wait_move()
-                self.move_xyz_vertical(
-                    place_x,
-                    place_y,
-                    drop_z,
+                self.move_precomputed_pwms(
+                    command["pwms"]["place_drop"],
                     self.move_time_ms,
                 )
                 self._wait_move()
@@ -349,10 +357,8 @@ class ArmController(Node):
                 )
                 record("place_released", piece_id=piece_id)
                 time.sleep(self.event_capture_hold_s)
-                self.move_xyz_vertical(
-                    place_x,
-                    place_y,
-                    travel_z,
+                self.move_precomputed_pwms(
+                    command["pwms"]["place_travel"],
                     self.move_time_ms,
                 )
                 self._wait_move()
@@ -455,6 +461,21 @@ class ArmController(Node):
         frame = self.ik.build_frame(pwms, time_ms)
         if frame is None:
             raise RuntimeError("Unable to build vertical IK frame")
+        self.send_raw(frame)
+
+    def move_precomputed_pwms(self, pwms, time_ms: int) -> None:
+        """Execute the exact IK result saved by the one-shot planner."""
+
+        values = tuple(int(pwm) for pwm in pwms)
+        if len(values) != 4:
+            raise RuntimeError(
+                f"Expected four precomputed joint PWMs, got {values}"
+            )
+        if any(pwm < 500 or pwm > 2500 for pwm in values):
+            raise RuntimeError(f"Precomputed PWM out of range: {values}")
+        frame = self.ik.build_frame(values, time_ms)
+        if frame is None:
+            raise RuntimeError("Unable to build precomputed IK frame")
         self.send_raw(frame)
 
     def rotate_tool(self, angle_deg: float, time_ms: int) -> None:
