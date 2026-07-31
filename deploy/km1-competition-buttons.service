@@ -1,0 +1,18 @@
+[Unit]
+Description=KM1 competition S1/S2 button launcher
+After=local-fs.target
+
+[Service]
+Type=simple
+User=wheeltec
+SupplementaryGroups=gpio dialout video
+Environment=JETSON_MODEL_NAME=JETSON_ORIN_NX
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/wheeltec/WorkSpace/km1_arm_ws/install/setup.bash && exec ros2 run km1_arm button_launcher'
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

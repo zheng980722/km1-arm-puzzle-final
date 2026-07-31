@@ -20,6 +20,8 @@ setup(
             'arm_controller = km1_arm.arm_controller:main',
             'control_test = km1_arm.control_test:main',
             'vision_bridge = km1_arm.vision_bridge:main',
+            'competition_task_runner = km1_arm.task_runner:main',
+            'button_launcher = km1_arm.button_launcher:main',
         ],
     },
 )
