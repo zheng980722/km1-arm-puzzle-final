@@ -27,6 +27,7 @@
   "task1_minimum_valid_edge_mm": 5.0,
   "task1_search_overlap_tolerance_mm2": 25.0,
   "task1_target_vertex_gap_mm": 7.0,
+  "task1_polygon_epsilon_mm": 2.0,
   "task2_short_edge_prune_mm": 10.0,
   "task2_search_overlap_tolerance_mm2": 25.0,
   "task2_target_vertex_gap_mm": 7.0,

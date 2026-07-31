@@ -201,6 +201,7 @@ class VisionConfig:
     task1_minimum_valid_edge_mm: float = 5.0
     task1_search_overlap_tolerance_mm2: float = 25.0
     task1_target_vertex_gap_mm: float = 7.0
+    task1_polygon_epsilon_mm: float = 2.0
     task2_short_edge_prune_mm: float = 10.0
     task2_search_overlap_tolerance_mm2: float = 25.0
     task2_target_vertex_gap_mm: float = 7.0
@@ -2243,6 +2244,14 @@ def run_pipeline(
     # a measured 20 mm minimum: calibration error can shorten a legal edge.
     config = replace(config)
     if competition_task == 1:
+        # At the current camera scale, 0.8 mm is sensitive to in-plane pose:
+        # antialiasing can split one physical edge into two.  Two millimetres
+        # preserves Task1's real >=10 mm edges while removing those bevels on
+        # the first pass, without a second camera capture or colour solve.
+        config.polygon_epsilon_mm = max(
+            config.polygon_epsilon_mm,
+            config.task1_polygon_epsilon_mm,
+        )
         config.short_edge_prune_mm = config.task1_short_edge_prune_mm
         config.minimum_valid_edge_mm = config.task1_minimum_valid_edge_mm
         config.overlap_tolerance_mm2 = (
@@ -2281,9 +2290,9 @@ def run_pipeline(
     # fits only when the complete rule-gated solver rejects it.  A retry still
     # has to pass every scene, rectangle, overlap, size, and score gate.
     attempt_configs = [frame_config]
-    for epsilon_mm in (2.5, 1.5):
+    for epsilon_mm in (2.5, 3.0):
         adapted = replace(frame_config)
-        adapted.polygon_epsilon_mm = min(
+        adapted.polygon_epsilon_mm = max(
             frame_config.polygon_epsilon_mm,
             epsilon_mm,
         )
