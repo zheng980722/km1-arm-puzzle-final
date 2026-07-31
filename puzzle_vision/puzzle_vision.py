@@ -144,8 +144,8 @@ class VisionConfig:
     max_post_placement_overlap_mm2: float = 0.0
 
     # OpenCV HSV values (H uses [0, 179]).
-    paper_hsv_low: tuple[int, int, int] = (30, 50, 40)
-    paper_hsv_high: tuple[int, int, int] = (95, 255, 255)
+    paper_hsv_low: tuple[int, int, int] = (45, 65, 150)
+    paper_hsv_high: tuple[int, int, int] = (65, 160, 240)
     background_lab_distance: float = 24.0
 
     border_ignore_mm: float = 2.0
