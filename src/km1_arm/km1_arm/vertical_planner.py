@@ -34,6 +34,7 @@ DEFAULT_LAYOUT_EDGE_MARGIN_MM = 2.0
 DEFAULT_LAYOUT_SEARCH_STEP_MM = 1.0
 DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
+TARGET_LAYOUT_LEFT_OFFSET_MM = 10.0
 VERTICAL_ALPHA_DEG = -90.0
 # Pickup contact may deviate by at most +/-8 degrees from vertical.  The order
 # is deliberate: exact vertical first, then the smallest symmetric deviation.
@@ -265,7 +266,12 @@ def _select_reachable_layout_translation(
     preferred_center = np.asarray(
         [
             PAPER_DEPTH_MM / 2.0,
-            0.5 * (SOURCE_TARGET_DIVIDER_MM + PAPER_WIDTH_MM),
+            # The robot is physically to the right of the landscape A4.
+            # Rectified paper y grows from the physical right edge toward the
+            # left edge, so this shifts every release point 10 mm farther from
+            # the arm without changing pairwise fragment spacing.
+            0.5 * (SOURCE_TARGET_DIVIDER_MM + PAPER_WIDTH_MM)
+            + TARGET_LAYOUT_LEFT_OFFSET_MM,
         ],
         dtype=np.float64,
     )

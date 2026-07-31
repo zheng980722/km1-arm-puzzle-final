@@ -173,7 +173,7 @@ class VisionConfig:
     pixels_per_mm: float = 6.0
 
     target_center_x_mm: float = 105.0
-    target_center_y_mm: float = 223.0
+    target_center_y_mm: float = 233.0
     placement_gap_mm: float = 5.0
     target_vertex_gap_mm: float = 5.0
     target_vertex_gap_tolerance_mm: float = 0.25

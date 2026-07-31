@@ -4,7 +4,7 @@
   "divider_y_mm": 148.5,
   "pixels_per_mm": 6.0,
   "target_center_x_mm": 105.0,
-  "target_center_y_mm": 223.0,
+  "target_center_y_mm": 233.0,
   "placement_gap_mm": 5.0,
   "target_vertex_gap_mm": 5.0,
   "target_vertex_gap_tolerance_mm": 0.25,
