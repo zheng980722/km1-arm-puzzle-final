@@ -8,7 +8,7 @@ Production data flow:
 The controller accepts only the complete schema-v2 vision envelope.  It
 chooses reachable grasp points from the detected polygons, constrains the
 electromagnet axis to vertical, performs all XY travel at a clearance height,
-and releases 10 mm above the paper without mechanical contact.
+and releases above the raised paper without mechanical contact.
 """
 
 from __future__ import annotations
@@ -26,7 +26,11 @@ from std_msgs.msg import String
 sys.path.insert(0, "/home/wheeltec/WorkSpace/km1_arm_ws/docs")
 from kinematics import Km1Kinematics  # noqa: E402
 
-from .control_geometry import MODIFIED_TOOL_LENGTH_MM, paper_to_robot
+from .control_geometry import (
+    MODIFIED_TOOL_LENGTH_MM,
+    PAPER_SURFACE_Z_MM,
+    paper_to_robot,
+)
 from .vertical_planner import (
     build_highest_vertical_control_plan,
     save_vertical_plan_artifacts,
@@ -49,8 +53,11 @@ class ArmController(Node):
     def __init__(self):
         super().__init__("km1_arm_controller")
         self.declare_parameter("enable_automatic_motion", False)
-        self.declare_parameter("paper_surface_z_mm", 0.0)
-        self.declare_parameter("pick_clearance_mm", 20.0)
+        self.declare_parameter("paper_surface_z_mm", PAPER_SURFACE_Z_MM)
+        # Verified collision-free height on the raised fixture.  The apparent
+        # drop in the latest run was caused by magnet-signal instability, not
+        # by insufficient pickup height.
+        self.declare_parameter("pick_clearance_mm", 30.0)
         self.declare_parameter("tool_length_mm", MODIFIED_TOOL_LENGTH_MM)
         self.declare_parameter("travel_clearance_mm", 150.0)
         self.declare_parameter("min_travel_clearance_mm", 70.0)
@@ -249,11 +256,15 @@ class ArmController(Node):
                 piece_id = int(command["piece_id"])
                 pick = command["pick"]
                 place = command["place"]
+                place_command = command.get("place_command", place)
                 rotation = float(command["rotation_delta_deg"])
                 pick_tool_yaw = float(command["pick_tool_yaw_deg"])
                 place_tool_yaw = float(command["place_tool_yaw_deg"])
                 pick_x, pick_y = paper_to_robot(*pick)
-                place_x, place_y = paper_to_robot(*place)
+                # The planner resolves the generic placement calibration once
+                # and embeds the compensated paper command in the executable
+                # plan.  Pickup remains on the raw vision coordinate.
+                place_x, place_y = paper_to_robot(*place_command)
                 pick_z = float(command["pick_z_mm"])
                 travel_z = float(command["travel_z_mm"])
                 drop_z = float(command["drop_z_mm"])
@@ -261,6 +272,7 @@ class ArmController(Node):
                 self.get_logger().info(
                     f"P{piece_id} ({index + 1}/{len(plan)}): "
                     f"pick={pick}, place={place}, "
+                    f"place_cmd={place_command}, "
                     f"inset={command['grasp_inset_mm']:.1f} mm, "
                     f"piece_yaw={rotation:.1f} deg, "
                     f"tool={pick_tool_yaw:.1f}->{place_tool_yaw:.1f} deg"
@@ -303,8 +315,8 @@ class ArmController(Node):
                 self.rotate_tool(place_tool_yaw, self.move_time_ms)
                 self._wait_move()
 
-                # PLACE: vertical approach, stop 10 mm above paper, then
-                # disable the magnet so the piece falls freely.
+                # PLACE: vertical approach to the configured clearance above
+                # the raised paper, then disable the magnet for a free fall.
                 self.move_xyz_vertical(
                     place_x,
                     place_y,
