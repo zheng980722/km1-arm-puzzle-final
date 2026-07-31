@@ -1,9 +1,9 @@
 """Bench geometry shared by KM1 visual planning and arm control.
 
-The current fixture uses a landscape A4 sheet.  Its near long-edge midpoint is
-aligned with the front midpoint of the KM1 base, and the sheet has been moved
-20 mm towards the robot from the former tangent position.  The vision pipeline
-rectifies that landscape sheet into a portrait 210 x 297 mm coordinate system:
+The current fixture uses a landscape A4 sheet.  Its near long edge is tangent
+to the front edge of the KM1 circular base, and the midpoint of both edges is
+aligned.  The vision pipeline rectifies that landscape sheet into a portrait
+210 x 297 mm coordinate system:
 
 * paper x: far edge (0) -> near/base edge (210)
 * paper y: physical right edge (0) -> physical left edge (297)
@@ -18,22 +18,15 @@ from __future__ import annotations
 PAPER_DEPTH_MM = 210.0
 PAPER_WIDTH_MM = 297.0
 BASE_FRONT_RADIUS_MM = 55.0
-PAPER_SHIFT_TOWARD_ROBOT_MM = 20.0
-PAPER_NEAR_EDGE_ROBOT_Y_MM = (
-    BASE_FRONT_RADIUS_MM - PAPER_SHIFT_TOWARD_ROBOT_MM
-)
 
-# The camera and robot did not move with the sheet.  The optical-centre
-# projection therefore lies 20 mm inside the new near edge, while its robot
-# coordinates remain unchanged at (0, 55) mm.  The lens is 460 mm above the
-# floor and the raised paper is 30 mm above the floor.
+# Current camera extrinsics.  The optical-centre projection coincides with
+# the midpoint of the A4 near long edge.  The lens is 460 mm above the floor
+# and the raised paper is 30 mm above the floor.
 CAMERA_FROM_NEAR_EDGE_X_MM = 0.0
-CAMERA_FROM_NEAR_EDGE_Y_MM = PAPER_SHIFT_TOWARD_ROBOT_MM
+CAMERA_FROM_NEAR_EDGE_Y_MM = 0.0
 CAMERA_HEIGHT_ABOVE_PAPER_MM = 430.0
 CAMERA_ROBOT_X_MM = CAMERA_FROM_NEAR_EDGE_X_MM
-CAMERA_ROBOT_Y_MM = (
-    PAPER_NEAR_EDGE_ROBOT_Y_MM + CAMERA_FROM_NEAR_EDGE_Y_MM
-)
+CAMERA_ROBOT_Y_MM = BASE_FRONT_RADIUS_MM + CAMERA_FROM_NEAR_EDGE_Y_MM
 
 # Modified end effector: rotating electromagnet cylinder.
 MAGNET_RADIUS_MM = 20.0
@@ -51,9 +44,7 @@ def paper_to_robot(paper_x_mm: float, paper_y_mm: float) -> tuple[float, float]:
 
     robot_x_mm = PAPER_WIDTH_MM / 2.0 - float(paper_y_mm)
     robot_y_mm = (
-        PAPER_NEAR_EDGE_ROBOT_Y_MM
-        + PAPER_DEPTH_MM
-        - float(paper_x_mm)
+        BASE_FRONT_RADIUS_MM + PAPER_DEPTH_MM - float(paper_x_mm)
     )
     return robot_x_mm, robot_y_mm
 
@@ -62,9 +53,7 @@ def robot_to_paper(robot_x_mm: float, robot_y_mm: float) -> tuple[float, float]:
     """Inverse of :func:`paper_to_robot`, useful during calibration."""
 
     paper_x_mm = (
-        PAPER_NEAR_EDGE_ROBOT_Y_MM
-        + PAPER_DEPTH_MM
-        - float(robot_y_mm)
+        BASE_FRONT_RADIUS_MM + PAPER_DEPTH_MM - float(robot_y_mm)
     )
     paper_y_mm = PAPER_WIDTH_MM / 2.0 - float(robot_x_mm)
     return paper_x_mm, paper_y_mm

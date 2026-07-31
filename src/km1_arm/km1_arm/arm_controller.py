@@ -187,15 +187,11 @@ class ArmController(Node):
             total_piece_count = int(
                 plan[0].get("total_piece_count", len(plan))
             )
-            skipped_piece_ids = list(
-                plan[0].get("skipped_piece_ids", [])
-            )
+            skipped_piece_ids = list(plan[0].get("skipped_piece_ids", []))
             if skipped_piece_ids:
                 self.get_logger().warning(
-                    "Partial execution selected: "
-                    f"planned={len(plan)}/{total_piece_count}, "
-                    f"skipped={skipped_piece_ids}. Reachable pieces will "
-                    "continue in -90-first order."
+                    "Partial-score execution: skipping unreachable pieces "
+                    f"{skipped_piece_ids}"
                 )
             self.get_logger().info(
                 "Accepted schema-v2 envelope: "
@@ -347,7 +343,7 @@ class ArmController(Node):
                 self._wait_move()
 
                 # PLACE: both high travel and release remain vertical.  The
-                # +/-10 degree fallback is exclusive to pickup contact.
+                # +/-8 degree fallback is exclusive to pickup contact.
                 self.move_precomputed_pwms(
                     command["pwms"]["place_travel"],
                     self.move_time_ms,
