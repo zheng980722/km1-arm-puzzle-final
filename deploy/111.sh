@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Eeo pipefail
 
 readonly WORKSPACE="/home/wheeltec/WorkSpace/km1_arm_ws"
 readonly LOCK_FILE="/tmp/km1_competition_task.lock"
