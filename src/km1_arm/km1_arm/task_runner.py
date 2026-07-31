@@ -59,6 +59,26 @@ def _new_timing_file(
     return None
 
 
+def _new_error_file(
+    output_root: Path,
+    files_before_start: set[Path],
+) -> tuple[Path, str] | None:
+    candidates = sorted(
+        output_root.glob("*/error.txt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        if path in files_before_start:
+            continue
+        try:
+            message = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        return path, message
+    return None
+
+
 def run_task(task: int, output_base: Path, timeout_s: float, enable_motion: bool) -> int:
     if task not in (1, 2):
         raise ValueError(f"unsupported task: {task}")
@@ -71,6 +91,7 @@ def run_task(task: int, output_base: Path, timeout_s: float, enable_motion: bool
     output_root = output_base / f"task{task}"
     output_root.mkdir(parents=True, exist_ok=True)
     files_before_start = set(output_root.glob("*/13_timing.json"))
+    errors_before_start = set(output_root.glob("*/error.txt"))
 
     command = [
         "ros2",
@@ -116,6 +137,18 @@ def run_task(task: int, output_base: Path, timeout_s: float, enable_motion: bool
                 time.sleep(1.0)
                 _stop_process_group(process, f"Task{task}")
                 return 0 if within_limit else 3
+
+            failed = _new_error_file(output_root, errors_before_start)
+            if failed is not None:
+                error_path, message = failed
+                print(
+                    f"[Task{task}] vision pipeline rejected the scene; "
+                    f"run={error_path.parent}; reason={message}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _stop_process_group(process, f"Task{task}")
+                return 5
 
             return_code = process.poll()
             if return_code is not None:
