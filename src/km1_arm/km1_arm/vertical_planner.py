@@ -143,7 +143,8 @@ def _select_reachable_grasp(
     center = np.asarray(center_mm, dtype=np.float64)
     minimum = np.floor(np.min(polygon, axis=0))
     maximum = np.ceil(np.max(polygon, axis=0))
-    candidates: list[tuple[float, np.ndarray, float, float]] = []
+    vertical_candidates: list[tuple[float, np.ndarray, float, float]] = []
+    fallback_candidates: list[tuple[float, np.ndarray, float, float]] = []
 
     # A vertical centroid remains the best-balanced grasp and is accepted
     # immediately.  If it is not vertically reachable, include it in the
@@ -180,9 +181,16 @@ def _select_reachable_grasp(
             0.02 * center_inset
             - CONTACT_TILT_SCORE_WEIGHT * center_tilt
         )
-        candidates.append(
-            (center_score, center.copy(), center_inset, center_contact[1])
+        candidate = (
+            center_score,
+            center.copy(),
+            center_inset,
+            center_contact[1],
         )
+        if center_contact[1] == VERTICAL_ALPHA_DEG:
+            vertical_candidates.append(candidate)
+        else:
+            fallback_candidates.append(candidate)
 
     x_values = np.arange(
         minimum[0],
@@ -230,8 +238,15 @@ def _select_reachable_grasp(
                 + 0.02 * inset
                 - CONTACT_TILT_SCORE_WEIGHT * contact_tilt
             )
-            candidates.append((score, point, inset, contact_alpha))
+            candidate = (score, point, inset, contact_alpha)
+            if contact_alpha == VERTICAL_ALPHA_DEG:
+                vertical_candidates.append(candidate)
+            else:
+                fallback_candidates.append(candidate)
 
+    # Exact vertical contact is a categorical priority. A tilted centroid must
+    # never outrank a slightly offset point that can be picked at -90 degrees.
+    candidates = vertical_candidates or fallback_candidates
     if not candidates:
         raise RuntimeError(
             "No downward-reachable point exists inside source polygon "
@@ -257,11 +272,6 @@ def _select_reachable_layout_translation(
 ) -> tuple[np.ndarray, dict[int, dict[str, Any]]]:
     """Find one rigid translation that moves the largest reachable subset."""
 
-    target_points = np.vstack(
-        [np.asarray(draft["target_polygon"], dtype=np.float64) for draft in drafts]
-    )
-    minimum = np.min(target_points, axis=0)
-    maximum = np.max(target_points, axis=0)
     preferred_center = np.asarray(
         [
             PAPER_DEPTH_MM / 2.0,
@@ -270,26 +280,50 @@ def _select_reachable_layout_translation(
         dtype=np.float64,
     )
     margin = max(0.0, float(edge_margin_mm))
-    lower_translation = np.asarray(
-        [
-            margin - minimum[0],
-            SOURCE_TARGET_DIVIDER_MM + margin - minimum[1],
-        ],
-        dtype=np.float64,
-    )
-    upper_translation = np.asarray(
-        [
-            PAPER_DEPTH_MM - margin - maximum[0],
-            PAPER_WIDTH_MM - margin - maximum[1],
-        ],
-        dtype=np.float64,
-    )
-    if np.any(lower_translation > upper_translation):
-        raise RuntimeError(
-            "Solved target assembly does not fit inside the destination half: "
-            f"bounds={np.round(minimum, 2).tolist()}.."
-            f"{np.round(maximum, 2).tolist()}"
+    piece_bounds: dict[
+        int,
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ] = {}
+    valid_intervals: list[tuple[np.ndarray, np.ndarray]] = []
+    for draft in drafts:
+        piece_id = int(draft["piece_id"])
+        polygon = np.asarray(draft["target_polygon"], dtype=np.float64)
+        minimum = np.min(polygon, axis=0)
+        maximum = np.max(polygon, axis=0)
+        lower = np.asarray(
+            [
+                margin - minimum[0],
+                SOURCE_TARGET_DIVIDER_MM + margin - minimum[1],
+            ],
+            dtype=np.float64,
         )
+        upper = np.asarray(
+            [
+                PAPER_DEPTH_MM - margin - maximum[0],
+                PAPER_WIDTH_MM - margin - maximum[1],
+            ],
+            dtype=np.float64,
+        )
+        piece_bounds[piece_id] = (minimum, maximum, lower, upper)
+        if np.all(lower <= upper):
+            valid_intervals.append((lower, upper))
+
+    if not valid_intervals:
+        raise RuntimeError(
+            "No individual target fragment fits inside the destination half"
+        )
+
+    # Search the union of every individually valid translation range. A large
+    # fallback layout may not fit as a whole, but this still finds the common
+    # shift that preserves and moves the largest possible subset.
+    lower_translation = np.min(
+        np.vstack([interval[0] for interval in valid_intervals]),
+        axis=0,
+    )
+    upper_translation = np.max(
+        np.vstack([interval[1] for interval in valid_intervals]),
+        axis=0,
+    )
 
     step = max(0.5, float(search_step_mm))
     starts = np.ceil(lower_translation / step) * step
@@ -309,6 +343,10 @@ def _select_reachable_layout_translation(
             solved_by_piece: dict[int, dict[str, Any]] = {}
             pulse_margin = float("inf")
             for draft in drafts:
+                piece_id = int(draft["piece_id"])
+                minimum, maximum, lower, upper = piece_bounds[piece_id]
+                if np.any(translation < lower) or np.any(translation > upper):
+                    continue
                 point = np.asarray(
                     draft["destination_grasp"],
                     dtype=np.float64,
@@ -369,7 +407,7 @@ def _select_reachable_layout_translation(
                 if piece_pulse_margin < float(min_pwm_margin_us):
                     continue
                 pulse_margin = min(pulse_margin, piece_pulse_margin)
-                solved_by_piece[int(draft["piece_id"])] = {
+                solved_by_piece[piece_id] = {
                     "place_travel": list(travel_pwms),
                     "place_drop": list(drop_pwms),
                     "place_travel_alpha_deg": VERTICAL_ALPHA_DEG,
@@ -381,8 +419,15 @@ def _select_reachable_layout_translation(
             if not solved_by_piece:
                 continue
 
-            shifted_minimum = minimum + translation
-            shifted_maximum = maximum + translation
+            solved_polygons = [
+                np.asarray(draft["target_polygon"], dtype=np.float64)
+                + translation
+                for draft in drafts
+                if int(draft["piece_id"]) in solved_by_piece
+            ]
+            solved_points = np.vstack(solved_polygons)
+            shifted_minimum = np.min(solved_points, axis=0)
+            shifted_maximum = np.max(solved_points, axis=0)
             boundary_clearance = min(
                 shifted_minimum[0],
                 shifted_minimum[1] - SOURCE_TARGET_DIVIDER_MM,
@@ -545,6 +590,22 @@ def build_vertical_control_plan(
             "No piece has a reachable pickup trajectory"
             + (f". {details}" if details else "")
         )
+
+    # Move all exact-vertical pieces first. Preserve the vision order inside
+    # the vertical and fallback classes.
+    sequence_index = {
+        piece_id: index for index, piece_id in enumerate(sequence)
+    }
+    drafts.sort(
+        key=lambda draft: (
+            abs(
+                float(draft["pick_contact_alpha_deg"])
+                - VERTICAL_ALPHA_DEG
+            )
+            > 1e-6,
+            sequence_index[int(draft["piece_id"])],
+        )
+    )
 
     layout_translation, place_pwms = _select_reachable_layout_translation(
         drafts,

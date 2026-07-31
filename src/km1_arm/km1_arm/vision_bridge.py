@@ -244,6 +244,19 @@ class VisionBridge(Node):
             )
             self._save_success(run_dir, frame, result)
 
+            if not result["scene_quality"].get("passed", True):
+                self.get_logger().warning(
+                    "Scene-quality gates downgraded to warnings: "
+                    + "; ".join(result["scene_quality"].get("issues", []))
+                )
+            solution = result["solution"]
+            if not solution.strict_constraints_passed:
+                self.get_logger().warning(
+                    "Best-effort puzzle layout selected: "
+                    f"mode={solution.fallback_mode}, "
+                    f"diagnostics={solution.solver_diagnostics}"
+                )
+
             plan = result.get("control_plan", [])
             if not plan:
                 raise RuntimeError("视觉成功但没有生成控制计划")
@@ -283,7 +296,7 @@ class VisionBridge(Node):
             message.data = json.dumps(envelope, ensure_ascii=False)
             self.pub_plan.publish(message)
             self.get_logger().info(
-                f"Published complete schema-v2 control envelope for "
+                f"Published best-effort schema-v2 control envelope for "
                 f"{len(plan)} pieces"
             )
         except Exception as exc:

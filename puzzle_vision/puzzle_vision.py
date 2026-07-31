@@ -349,6 +349,9 @@ class PuzzleSolution:
     target_polygons_mm: dict[int, np.ndarray]
     target_transforms: dict[int, RigidTransform]
     matches: list[EdgeMatch]
+    strict_constraints_passed: bool = True
+    fallback_mode: str = "strict_rectangle"
+    solver_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, pieces: list[PieceObservation]) -> dict[str, Any]:
         observations = {piece.piece_id: piece for piece in pieces}
@@ -430,6 +433,9 @@ class PuzzleSolution:
                 float(self.placement_overlap_area_mm2),
                 6,
             ),
+            "strict_constraints_passed": self.strict_constraints_passed,
+            "fallback_mode": self.fallback_mode,
+            "solver_diagnostics": self.solver_diagnostics,
             "matches": [asdict(match) for match in self.matches],
             "placements": placements,
         }
@@ -1790,13 +1796,34 @@ def solve_puzzle(
     config: VisionConfig,
 ) -> PuzzleSolution:
     states = enumerate_assemblies(pieces, config)
+    fallback_mode = "strict_rectangle"
+    strict_constraints_passed = True
     if not states:
-        raise RuntimeError(
-            "No valid assembly was found. Check segmentation, polygon fitting, "
-            "edge tolerance, or overlap tolerance."
-        )
+        # No matched-edge assembly exists. Preserve the judge-provided source
+        # layout and translate it as one rigid arrangement into the target
+        # half, so the controller can still move every reachable contour.
+        states = [
+            AssemblyState(
+                placements={
+                    piece.piece_id: RigidTransform(
+                        angle_deg=0.0,
+                        translation_mm=piece.center_mm.copy(),
+                    )
+                    for piece in pieces
+                }
+            )
+        ]
+        fallback_mode = "translated_source_layout"
+        strict_constraints_passed = False
 
     ranked: list[tuple[float, float, float, AssemblyState, tuple[float, float]]] = []
+    relaxed_ranked: list[
+        tuple[
+            tuple[bool, float, float, bool, float],
+            tuple[float, float, float, AssemblyState, tuple[float, float]],
+        ]
+    ] = []
+    metrics_by_state: dict[int, dict[str, Any]] = {}
     for state in states:
         (
             fill_error,
@@ -1806,16 +1833,12 @@ def solve_puzzle(
             _,
             _,
         ) = _assembly_geometry(state, pieces)
-        if fill_error > config.max_rectangle_fill_error:
-            continue
         total_piece_area = max(
             sum(piece.area_mm2 for piece in pieces),
             1.0,
         )
-        if overlap_ratio * total_piece_area > config.overlap_tolerance_mm2:
-            continue
-        if not _each_piece_has_outer_edge(state, pieces, config):
-            continue
+        overlap_area_mm2 = overlap_ratio * total_piece_area
+        outer_edge_passed = _each_piece_has_outer_edge(state, pieces, config)
 
         # 矩形度约束: 凸包顶点数 + 面积比
         polygons = _state_polygons(state, pieces)
@@ -1845,24 +1868,50 @@ def solve_puzzle(
             else 0.0
         )
         score = geometric_score + config.texture_weight * texture_score
-        ranked.append(
+        entry = (
+            score,
+            geometric_score,
+            texture_score,
+            state,
+            (long_side, short_side),
+        )
+        strict_passed = (
+            fallback_mode == "strict_rectangle"
+            and fill_error <= config.max_rectangle_fill_error
+            and overlap_area_mm2 <= config.overlap_tolerance_mm2
+            and outer_edge_passed
+        )
+        metrics_by_state[id(state)] = {
+            "fill_error": float(fill_error),
+            "overlap_area_mm2": float(overlap_area_mm2),
+            "outer_edge_passed": bool(outer_edge_passed),
+            "strict_passed": bool(strict_passed),
+            "rectangle_size_mm": [float(long_side), float(short_side)],
+        }
+        # Best-effort priority: avoid physical overlap, then minimise the
+        # rectangular fill error. Outer-boundary compliance and score break
+        # ties but never turn a movable scene into a rejected scene.
+        relaxed_ranked.append(
             (
-                score,
-                geometric_score,
-                texture_score,
-                state,
-                (long_side, short_side),
+                (
+                    overlap_area_mm2 > config.overlap_tolerance_mm2,
+                    float(overlap_area_mm2),
+                    float(fill_error),
+                    not outer_edge_passed,
+                    float(score),
+                ),
+                entry,
             )
         )
+        if strict_passed:
+            ranked.append(entry)
 
     if not ranked:
-        raise RuntimeError(
-            "No rule-compliant assembly was found: candidates must form a "
-            f"rectangle with fill error <= {config.max_rectangle_fill_error:.0%}, "
-            "avoid overlap, and place at least one edge of every fragment on "
-            "the rectangle boundary. The assembled external dimensions are "
-            "not restricted."
-        )
+        _, best_relaxed = min(relaxed_ranked, key=lambda item: item[0])
+        ranked = [best_relaxed]
+        strict_constraints_passed = False
+        if fallback_mode == "strict_rectangle":
+            fallback_mode = "best_approximate_rectangle"
 
     selected: tuple[
         float,
@@ -1880,6 +1929,23 @@ def solve_puzzle(
     ] | None = None
     selected_soft_score = float("inf")
     rejected_overlap = 0.0
+    best_overlap_fallback: tuple[
+        tuple[float, float],
+        tuple[
+            float,
+            float,
+            float,
+            AssemblyState,
+            dict[int, RigidTransform],
+            dict[int, np.ndarray],
+            tuple[float, float],
+            tuple[float, float],
+            float,
+            float,
+            float,
+            float,
+        ],
+    ] | None = None
     for score, geometric, texture, state, _ in sorted(
         ranked,
         key=lambda item: item[0],
@@ -1895,6 +1961,26 @@ def solve_puzzle(
         ) = _normalise_solution_layout(state, pieces, config)
         placement_overlap = _raster_overlap_area(polygons.values(), scale=4.0)
         rejected_overlap = max(rejected_overlap, placement_overlap)
+        candidate = (
+            score,
+            geometric,
+            texture,
+            state,
+            transforms,
+            polygons,
+            rectangle_size,
+            placement_extent,
+            max_vertex_gap,
+            min_pairwise_gap,
+            applied_clearance,
+            placement_overlap,
+        )
+        fallback_key = (float(placement_overlap), float(score))
+        if (
+            best_overlap_fallback is None
+            or fallback_key < best_overlap_fallback[0]
+        ):
+            best_overlap_fallback = (fallback_key, candidate)
         # Clearance is a soft control allowance.  Prefer a compact candidate
         # near the requested allowance, but never reject an otherwise correct
         # random-size puzzle merely because it cannot attain that number.
@@ -1906,29 +1992,13 @@ def solve_puzzle(
             soft_score = score + clearance_soft_error
             if soft_score < selected_soft_score:
                 selected_soft_score = soft_score
-                selected = (
-                    score,
-                    geometric,
-                    texture,
-                    state,
-                    transforms,
-                    polygons,
-                    rectangle_size,
-                    placement_extent,
-                    max_vertex_gap,
-                    min_pairwise_gap,
-                    applied_clearance,
-                    placement_overlap,
-                )
+                selected = candidate
     if selected is None:
-        raise RuntimeError(
-            "All candidate assemblies failed the control-clearance gate: "
-            f"post-placement overlap must be <= "
-            f"{config.max_post_placement_overlap_mm2:.3f} mm² "
-            f"(largest examined overlap {rejected_overlap:.3f} mm²). "
-            f"The requested {config.target_vertex_gap_mm:.2f} mm spacing is "
-            "only a soft control allowance."
-        )
+        if best_overlap_fallback is None:
+            raise RuntimeError("No geometric target could be generated")
+        selected = best_overlap_fallback[1]
+        strict_constraints_passed = False
+        fallback_mode = "minimum_overlap_layout"
     (
         score,
         geometric,
@@ -1943,6 +2013,30 @@ def solve_puzzle(
         applied_clearance,
         placement_overlap,
     ) = selected
+    selected_metrics = metrics_by_state.get(id(best_state), {})
+    solver_diagnostics = {
+        "assembly_candidates": len(states),
+        "strict_candidates": sum(
+            bool(metrics.get("strict_passed"))
+            for metrics in metrics_by_state.values()
+        ),
+        "selected_fill_error": round(
+            float(selected_metrics.get("fill_error", 0.0)),
+            6,
+        ),
+        "selected_nominal_overlap_mm2": round(
+            float(selected_metrics.get("overlap_area_mm2", 0.0)),
+            6,
+        ),
+        "selected_outer_edge_passed": bool(
+            selected_metrics.get("outer_edge_passed", False)
+        ),
+        "post_clearance_overlap_mm2": round(float(placement_overlap), 6),
+        "largest_examined_post_clearance_overlap_mm2": round(
+            float(rejected_overlap),
+            6,
+        ),
+    }
     # `score` ranks already rule-filtered candidates; it is not a physical
     # safety measurement.  Keep it as a diagnostic instead of hard-rejecting
     # random sizes/cuts near an arbitrary historical threshold.
@@ -1960,6 +2054,9 @@ def solve_puzzle(
         target_polygons_mm=polygons,
         target_transforms=transforms,
         matches=best_state.matches,
+        strict_constraints_passed=strict_constraints_passed,
+        fallback_mode=fallback_mode,
+        solver_diagnostics=solver_diagnostics,
     )
 
 
@@ -2316,9 +2413,11 @@ def run_pipeline(
                 attempt_config,
             )
             if not scene_quality["passed"]:
-                raise RuntimeError(
-                    "场景质量检查未通过: " + "; ".join(scene_quality["issues"])
-                )
+                # The judge controls the initial placement and there is no
+                # opportunity for a second arrangement. Keep every quality
+                # gate as a diagnostic warning, then move every contour that
+                # the downstream reachability planner can execute.
+                scene_quality["warning_only"] = True
             selected_mode = (
                 infer_mode(pieces, attempt_config) if mode == "auto" else mode
             )
