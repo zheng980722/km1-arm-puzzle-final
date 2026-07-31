@@ -53,7 +53,10 @@ class VisionBridge(Node):
         self.declare_parameter("auto_trigger", False)
         self.declare_parameter("auto_trigger_delay_s", 7.0)
         self.declare_parameter("run_started_unix_s", 0.0)
-        self.declare_parameter("mode", "auto")
+        # Production must remain invariant to the printed card face.  The
+        # solver's "white" mode is its geometry-only path (texture score is
+        # forced to zero), even when the detected fragments are playing cards.
+        self.declare_parameter("mode", "white")
         self.declare_parameter("layout", "bench_right_to_left")
         self.declare_parameter("config_json", default_config)
         self.declare_parameter("diagnostic_dir", default_log_dir)
