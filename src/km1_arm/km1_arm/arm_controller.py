@@ -263,10 +263,17 @@ class ArmController(Node):
             self.rotate_tool(0.0, 500)
             time.sleep(0.65)
             selected_travel_z = float(plan[0]["travel_z_mm"])
+            staging_z = self._select_reachable_staging_z(selected_travel_z)
+            if staging_z < selected_travel_z - 1e-6:
+                self.get_logger().warning(
+                    "Safe staging Z lowered from "
+                    f"{selected_travel_z:.1f} to {staging_z:.1f} mm; "
+                    "piece travel poses keep their planned height"
+                )
             self.move_xyz_vertical(
                 SAFE_STAGING_X_MM,
                 SAFE_STAGING_Y_MM,
-                selected_travel_z,
+                staging_z,
                 self.move_time_ms,
             )
             self._wait_move()
@@ -412,7 +419,7 @@ class ArmController(Node):
             self.move_xyz_vertical(
                 SAFE_STAGING_X_MM,
                 SAFE_STAGING_Y_MM,
-                selected_travel_z,
+                staging_z,
                 self.move_time_ms,
             )
             self._wait_move()
@@ -482,6 +489,26 @@ class ArmController(Node):
 
     def _wait_move(self) -> None:
         time.sleep(self.move_time_ms / 1000.0 + 0.15)
+
+    def _select_reachable_staging_z(self, requested_z_mm: float) -> float:
+        """Use the highest reachable Z at the fixed safe staging point."""
+
+        minimum_z = self.paper_surface_z_mm + self.min_travel_clearance_mm
+        step = max(1.0, self.travel_search_step_mm)
+        candidate = float(requested_z_mm)
+        while candidate >= minimum_z - 1e-6:
+            pwms = self.ik.solve_vertical(
+                SAFE_STAGING_X_MM,
+                SAFE_STAGING_Y_MM,
+                candidate,
+            )
+            if pwms is not None and all(500 <= pwm <= 2500 for pwm in pwms):
+                return candidate
+            candidate -= step
+        raise RuntimeError(
+            "No reachable safe staging pose between "
+            f"{minimum_z:.1f} and {requested_z_mm:.1f} mm"
+        )
 
     def move_xyz_vertical(
         self,
