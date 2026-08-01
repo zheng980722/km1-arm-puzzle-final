@@ -85,6 +85,8 @@ def generate_launch_description():
                         "move_time_ms": 1000,
                         "magnet_dwell_ms": 350,
                         "event_capture_hold_s": 0.75,
+                        "completion_beep_count": 2,
+                        "completion_beep_gap_s": 0.35,
                     }
                 ],
             ),

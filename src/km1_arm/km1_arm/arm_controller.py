@@ -65,6 +65,8 @@ class ArmController(Node):
         self.declare_parameter("move_time_ms", 1000)
         self.declare_parameter("magnet_dwell_ms", 350)
         self.declare_parameter("event_capture_hold_s", 0.75)
+        self.declare_parameter("completion_beep_count", 2)
+        self.declare_parameter("completion_beep_gap_s", 0.35)
 
         self.enable_automatic_motion = bool(
             self.get_parameter("enable_automatic_motion").value
@@ -112,6 +114,14 @@ class ArmController(Node):
         self.event_capture_hold_s = max(
             0.0,
             float(self.get_parameter("event_capture_hold_s").value),
+        )
+        self.completion_beep_count = max(
+            0,
+            int(self.get_parameter("completion_beep_count").value),
+        )
+        self.completion_beep_gap_s = max(
+            0.0,
+            float(self.get_parameter("completion_beep_gap_s").value),
         )
         self.ik = Km1Kinematics(
             tool_length_mm=float(
@@ -408,6 +418,19 @@ class ArmController(Node):
             self._wait_move()
             self.park(1800)
             time.sleep(2.0)
+            for beep_index in range(self.completion_beep_count):
+                self.beep()
+                if beep_index + 1 < self.completion_beep_count:
+                    time.sleep(self.completion_beep_gap_s)
+            if self.completion_beep_count:
+                record(
+                    "completion_beep",
+                    count=self.completion_beep_count,
+                )
+                self.get_logger().info(
+                    "Completion beeper sounded "
+                    f"{self.completion_beep_count} times"
+                )
             self._publish_status(
                 {
                     "event": "all_done",
@@ -516,6 +539,11 @@ class ArmController(Node):
 
     def magnet_off(self) -> None:
         self.send_raw(f"#005P{MAGNET_OFF:04d}T0100!")
+
+    def beep(self) -> None:
+        """Sound the controller-board passive buzzer once."""
+
+        self.send_raw("$BEEP!\n")
 
     def park(self, time_ms: int) -> None:
         parts = [
