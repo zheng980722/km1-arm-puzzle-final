@@ -36,10 +36,6 @@ DEFAULT_LAYOUT_NEAR_EDGE_MARGIN_MM = DEFAULT_LAYOUT_EDGE_MARGIN_MM
 DEFAULT_LAYOUT_SEARCH_STEP_MM = 1.0
 DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
-# Preserve the vision orientation first, then try quarter-turn alternatives.
-# A rigid rotation keeps every inter-piece gap unchanged while allowing a long
-# reconstruction to follow the arm's radial workspace instead of crossing it.
-LAYOUT_ROTATION_CANDIDATES_DEG = (0.0, -90.0, 90.0, 180.0)
 COARSE_LAYOUT_SEARCH_STEP_MM = 4.0
 PREFLIGHT_LAYOUT_SEARCH_STEP_MM = 2.0
 VERTICAL_ALPHA_DEG = -90.0
@@ -122,6 +118,16 @@ def _rotate_layout_envelope(
         )
     rotated["layout_rotation_deg"] = float(angle_deg)
     return rotated
+
+
+def _fallback_layout_rotation_candidates() -> tuple[float, ...]:
+    """Return reachability-only rotations, smallest change first."""
+
+    candidates = [0.0]
+    for magnitude in range(15, 180, 15):
+        candidates.extend((-float(magnitude), float(magnitude)))
+    candidates.append(180.0)
+    return tuple(candidates)
 
 
 def _pose_pwms(
@@ -320,6 +326,64 @@ def _select_reachable_grasp(
     return point, float(inset), float(contact_alpha)
 
 
+def _solve_destination_pose(
+    draft: dict[str, Any],
+    ik,
+    point: np.ndarray,
+    *,
+    travel_z_mm: float,
+    drop_z_mm: float,
+    min_pwm_margin_us: int,
+) -> dict[str, Any] | None:
+    """Solve one vertical destination pose including base/tool-yaw guards."""
+
+    travel_pwms = _vertical_pwms(ik, point, travel_z_mm)
+    drop_pwms = _vertical_pwms(ik, point, drop_z_mm)
+    if travel_pwms is None or drop_pwms is None:
+        return None
+    pulse_margin = float("inf")
+    for pwm in (*travel_pwms, *drop_pwms):
+        pulse_margin = min(
+            pulse_margin,
+            float(pwm - PWM_MIN),
+            float(PWM_MAX - pwm),
+        )
+    pick_robot_x, pick_robot_y = paper_to_robot(*draft["source_grasp"])
+    place_robot_x, place_robot_y = paper_to_robot(*point)
+    pick_base_deg = math.degrees(math.atan2(pick_robot_x, pick_robot_y))
+    place_base_deg = math.degrees(math.atan2(place_robot_x, place_robot_y))
+    base_rotation_deg = _normalise_angle(place_base_deg - pick_base_deg)
+    required_tool_delta_deg = _normalise_angle(
+        float(draft["rotation_delta_deg"]) - base_rotation_deg
+    )
+    pick_tool_yaw_deg = -0.5 * required_tool_delta_deg
+    place_tool_yaw_deg = 0.5 * required_tool_delta_deg
+    if (
+        abs(pick_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
+        or abs(place_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
+    ):
+        return None
+    for yaw_deg in (pick_tool_yaw_deg, place_tool_yaw_deg):
+        yaw_pwm = 1500.0 + (2000.0 / 270.0) * yaw_deg
+        pulse_margin = min(
+            pulse_margin,
+            yaw_pwm - PWM_MIN,
+            PWM_MAX - yaw_pwm,
+        )
+    if pulse_margin < float(min_pwm_margin_us):
+        return None
+    return {
+        "place_travel": list(travel_pwms),
+        "place_drop": list(drop_pwms),
+        "place_travel_alpha_deg": VERTICAL_ALPHA_DEG,
+        "place_drop_alpha_deg": VERTICAL_ALPHA_DEG,
+        "pick_tool_yaw_deg": pick_tool_yaw_deg,
+        "place_tool_yaw_deg": place_tool_yaw_deg,
+        "base_rotation_deg": base_rotation_deg,
+        "pulse_margin_us": pulse_margin,
+    }
+
+
 def _select_reachable_layout_translation(
     drafts: list[dict[str, Any]],
     ik,
@@ -420,71 +484,21 @@ def _select_reachable_layout_translation(
                     draft["destination_grasp"],
                     dtype=np.float64,
                 ) + translation
-                travel_pwms = _vertical_pwms(
+                destination_pose = _solve_destination_pose(
+                    draft,
                     ik,
                     point,
-                    travel_z_mm,
+                    travel_z_mm=travel_z_mm,
+                    drop_z_mm=drop_z_mm,
+                    min_pwm_margin_us=min_pwm_margin_us,
                 )
-                drop_pwms = _vertical_pwms(
-                    ik,
-                    point,
-                    drop_z_mm,
-                )
-                if travel_pwms is None or drop_pwms is None:
+                if destination_pose is None:
                     continue
-                piece_pulse_margin = float("inf")
-                for pwm in (*travel_pwms, *drop_pwms):
-                    piece_pulse_margin = min(
-                        piece_pulse_margin,
-                        float(pwm - PWM_MIN),
-                        float(PWM_MAX - pwm),
-                    )
-                pick_robot_x, pick_robot_y = paper_to_robot(
-                    *draft["source_grasp"]
+                pulse_margin = min(
+                    pulse_margin,
+                    float(destination_pose["pulse_margin_us"]),
                 )
-                place_robot_x, place_robot_y = paper_to_robot(*point)
-                pick_base_deg = math.degrees(
-                    math.atan2(pick_robot_x, pick_robot_y)
-                )
-                place_base_deg = math.degrees(
-                    math.atan2(place_robot_x, place_robot_y)
-                )
-                base_rotation_deg = _normalise_angle(
-                    place_base_deg - pick_base_deg
-                )
-                required_tool_delta_deg = _normalise_angle(
-                    float(draft["rotation_delta_deg"]) - base_rotation_deg
-                )
-                # Splitting the relative tool motion evenly between pickup
-                # and placement minimises the largest absolute ID4 angle.
-                # Since the required relative rotation is normalised to
-                # ±180 degrees, both endpoints remain inside ±90 degrees.
-                pick_tool_yaw_deg = -0.5 * required_tool_delta_deg
-                place_tool_yaw_deg = 0.5 * required_tool_delta_deg
-                if (
-                    abs(pick_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
-                    or abs(place_tool_yaw_deg) > TOOL_YAW_LIMIT_DEG
-                ):
-                    continue
-                for yaw_deg in (pick_tool_yaw_deg, place_tool_yaw_deg):
-                    yaw_pwm = 1500.0 + (2000.0 / 270.0) * yaw_deg
-                    piece_pulse_margin = min(
-                        piece_pulse_margin,
-                        yaw_pwm - PWM_MIN,
-                        PWM_MAX - yaw_pwm,
-                    )
-                if piece_pulse_margin < float(min_pwm_margin_us):
-                    continue
-                pulse_margin = min(pulse_margin, piece_pulse_margin)
-                solved_by_piece[piece_id] = {
-                    "place_travel": list(travel_pwms),
-                    "place_drop": list(drop_pwms),
-                    "place_travel_alpha_deg": VERTICAL_ALPHA_DEG,
-                    "place_drop_alpha_deg": VERTICAL_ALPHA_DEG,
-                    "pick_tool_yaw_deg": pick_tool_yaw_deg,
-                    "place_tool_yaw_deg": place_tool_yaw_deg,
-                    "base_rotation_deg": base_rotation_deg,
-                }
+                solved_by_piece[piece_id] = destination_pose
             if not solved_by_piece:
                 continue
 
@@ -798,6 +812,351 @@ def build_vertical_control_plan(
     return plan
 
 
+def _point_segment_distance(
+    point: np.ndarray,
+    start: np.ndarray,
+    end: np.ndarray,
+) -> float:
+    vector = end - start
+    denominator = float(np.dot(vector, vector))
+    if denominator <= 1e-12:
+        return float(np.linalg.norm(point - start))
+    ratio = float(np.dot(point - start, vector)) / denominator
+    ratio = max(0.0, min(1.0, ratio))
+    return float(np.linalg.norm(point - (start + ratio * vector)))
+
+
+def _segments_intersect(
+    a0: np.ndarray,
+    a1: np.ndarray,
+    b0: np.ndarray,
+    b1: np.ndarray,
+) -> bool:
+    def cross(origin, first, second) -> float:
+        return float(np.cross(first - origin, second - origin))
+
+    def on_segment(start, point, end) -> bool:
+        return (
+            min(start[0], end[0]) - 1e-7
+            <= point[0]
+            <= max(start[0], end[0]) + 1e-7
+            and min(start[1], end[1]) - 1e-7
+            <= point[1]
+            <= max(start[1], end[1]) + 1e-7
+        )
+
+    c1 = cross(a0, a1, b0)
+    c2 = cross(a0, a1, b1)
+    c3 = cross(b0, b1, a0)
+    c4 = cross(b0, b1, a1)
+    if c1 * c2 < -1e-9 and c3 * c4 < -1e-9:
+        return True
+    for value, point, start, end in (
+        (c1, b0, a0, a1),
+        (c2, b1, a0, a1),
+        (c3, a0, b0, b1),
+        (c4, a1, b0, b1),
+    ):
+        if abs(value) <= 1e-7 and on_segment(start, point, end):
+            return True
+    return False
+
+
+def _polygons_keep_clearance(
+    polygon_a: np.ndarray,
+    polygon_b: np.ndarray,
+    minimum_gap_mm: float = 1.0,
+) -> bool:
+    """Return true when two simple polygons neither overlap nor touch."""
+
+    a = np.asarray(polygon_a, dtype=np.float64)
+    b = np.asarray(polygon_b, dtype=np.float64)
+    for index_a in range(len(a)):
+        for index_b in range(len(b)):
+            if _segments_intersect(
+                a[index_a],
+                a[(index_a + 1) % len(a)],
+                b[index_b],
+                b[(index_b + 1) % len(b)],
+            ):
+                return False
+    if cv2.pointPolygonTest(
+        b.astype(np.float32), tuple(a[0].astype(float)), False
+    ) >= 0:
+        return False
+    if cv2.pointPolygonTest(
+        a.astype(np.float32), tuple(b[0].astype(float)), False
+    ) >= 0:
+        return False
+    minimum = float("inf")
+    for point in a:
+        for index in range(len(b)):
+            minimum = min(
+                minimum,
+                _point_segment_distance(
+                    point,
+                    b[index],
+                    b[(index + 1) % len(b)],
+                ),
+            )
+    for point in b:
+        for index in range(len(a)):
+            minimum = min(
+                minimum,
+                _point_segment_distance(
+                    point,
+                    a[index],
+                    a[(index + 1) % len(a)],
+                ),
+            )
+    return minimum >= float(minimum_gap_mm)
+
+
+def _append_nearest_reachable_fallbacks(
+    envelope: dict[str, Any],
+    plan: list[dict[str, Any]],
+    ik,
+    *,
+    paper_surface_z_mm: float,
+    min_travel_clearance_mm: float,
+    layout_edge_margin_mm: float,
+    layout_near_edge_margin_mm: float,
+    min_pwm_margin_us: int,
+) -> list[dict[str, Any]]:
+    """Move skipped pieces to the nearest safe reachable destination."""
+
+    if not plan:
+        return plan
+    skipped_ids = [int(value) for value in plan[0].get("skipped_piece_ids", [])]
+    if not skipped_ids:
+        for item in plan:
+            item.setdefault("approximate_target", False)
+            item.setdefault("approximate_offset_mm", [0.0, 0.0])
+            item.setdefault("approximate_distance_mm", 0.0)
+        return plan
+
+    layout_rotation = float(plan[0].get("layout_rotation_deg", 0.0))
+    rotated = _rotate_layout_envelope(envelope, layout_rotation)
+    pieces = {int(item["piece_id"]): item for item in rotated["pieces"]}
+    placements = {
+        int(item["piece_id"]): item
+        for item in rotated["solution"]["placements"]
+    }
+    sequence = [int(item["piece_id"]) for item in rotated["control_plan"]]
+    translation = np.asarray(plan[0]["layout_translation_mm"], dtype=np.float64)
+    pick_z = float(plan[0]["pick_z_mm"])
+    travel_z = float(plan[0]["travel_z_mm"])
+    drop_z = float(plan[0]["drop_z_mm"])
+    validation_z = float(paper_surface_z_mm) + min(
+        travel_z - float(paper_surface_z_mm),
+        float(min_travel_clearance_mm),
+    )
+    occupied_polygons = [
+        np.asarray(item["target_polygon"], dtype=np.float64)
+        for item in plan
+    ]
+    approximate_ids: list[int] = []
+    still_skipped: list[int] = []
+    original_reasons = {
+        int(piece_id): str(reason)
+        for piece_id, reason in plan[0].get("skipped_reasons", {}).items()
+    }
+    margin = max(0.0, float(layout_edge_margin_mm))
+    near_margin = max(margin, float(layout_near_edge_margin_mm))
+
+    for piece_id in skipped_ids:
+        piece = pieces[piece_id]
+        placement = placements[piece_id]
+        source_center = np.asarray(piece["center_mm"], dtype=np.float64)
+        source_polygon = np.asarray(piece["vertices_mm"], dtype=np.float64)
+        try:
+            source_grasp, inset, contact_alpha = _select_reachable_grasp(
+                source_polygon,
+                source_center,
+                ik,
+                pick_z_mm=pick_z,
+                travel_z_mm=validation_z,
+            )
+        except RuntimeError:
+            still_skipped.append(piece_id)
+            continue
+        pick_travel_pose = _select_downward_pose(
+            ik,
+            source_grasp,
+            travel_z,
+            flattest_alpha_deg=TRAVEL_FLATTEST_ALPHA_DEG,
+        )
+        pick_contact_pwms = _pose_pwms(
+            ik,
+            source_grasp,
+            pick_z,
+            contact_alpha,
+        )
+        if pick_travel_pose is None or pick_contact_pwms is None:
+            still_skipped.append(piece_id)
+            continue
+        pick_travel_pwms, pick_travel_alpha = pick_travel_pose
+        rotation_delta = _normalise_angle(placement["rotation_delta_deg"])
+        target_center = np.asarray(
+            [
+                placement["target_pose"]["x_mm"],
+                placement["target_pose"]["y_mm"],
+            ],
+            dtype=np.float64,
+        )
+        destination_grasp = (
+            target_center
+            + _rotation_matrix(rotation_delta)
+            @ (source_grasp - source_center)
+            + translation
+        )
+        desired_polygon = (
+            np.asarray(placement["target_polygon_mm"], dtype=np.float64)
+            + translation
+        )
+        desired_center = target_center + translation
+        draft = {
+            "source_grasp": source_grasp,
+            "rotation_delta_deg": rotation_delta,
+        }
+        polygon_minimum = np.min(desired_polygon, axis=0)
+        polygon_maximum = np.max(desired_polygon, axis=0)
+        lower_offset = np.asarray(
+            [
+                margin - polygon_minimum[0],
+                SOURCE_TARGET_DIVIDER_MM + margin - polygon_minimum[1],
+            ],
+            dtype=np.float64,
+        )
+        upper_offset = np.asarray(
+            [
+                PAPER_DEPTH_MM - near_margin - polygon_maximum[0],
+                PAPER_WIDTH_MM - margin - polygon_maximum[1],
+            ],
+            dtype=np.float64,
+        )
+        x_values = np.arange(
+            math.ceil(lower_offset[0]),
+            math.floor(upper_offset[0]) + 1.0,
+            1.0,
+        )
+        y_values = np.arange(
+            math.ceil(lower_offset[1]),
+            math.floor(upper_offset[1]) + 1.0,
+            1.0,
+        )
+        offsets = [
+            np.asarray([x_value, y_value], dtype=np.float64)
+            for x_value in x_values
+            for y_value in y_values
+        ]
+        offsets.sort(key=lambda value: float(np.dot(value, value)))
+        selected = None
+        for offset in offsets:
+            candidate_polygon = desired_polygon + offset
+            if not all(
+                _polygons_keep_clearance(candidate_polygon, occupied, 1.0)
+                for occupied in occupied_polygons
+            ):
+                continue
+            candidate_point = destination_grasp + offset
+            destination_pose = _solve_destination_pose(
+                draft,
+                ik,
+                candidate_point,
+                travel_z_mm=travel_z,
+                drop_z_mm=drop_z,
+                min_pwm_margin_us=min_pwm_margin_us,
+            )
+            if destination_pose is not None:
+                selected = (
+                    offset,
+                    candidate_point,
+                    candidate_polygon,
+                    destination_pose,
+                )
+                break
+        if selected is None:
+            still_skipped.append(piece_id)
+            continue
+
+        offset, place_point, target_polygon, destination_pose = selected
+        approximate_ids.append(piece_id)
+        occupied_polygons.append(target_polygon)
+        plan.append(
+            {
+                "piece_id": piece_id,
+                "pick": np.round(source_grasp, 3).tolist(),
+                "place": np.round(place_point, 3).tolist(),
+                "theoretical_place": np.round(destination_grasp, 3).tolist(),
+                "source_center": np.round(source_center, 3).tolist(),
+                "target_center": np.round(desired_center + offset, 3).tolist(),
+                "theoretical_target_center": np.round(
+                    desired_center, 3
+                ).tolist(),
+                "source_polygon": np.round(source_polygon, 3).tolist(),
+                "target_polygon": np.round(target_polygon, 3).tolist(),
+                "theoretical_target_polygon": np.round(
+                    desired_polygon, 3
+                ).tolist(),
+                "layout_translation_mm": np.round(translation, 3).tolist(),
+                "layout_rotation_deg": layout_rotation,
+                "grasp_inset_mm": round(float(inset), 3),
+                "rotation_delta_deg": round(float(rotation_delta), 3),
+                "pick_tool_yaw_deg": round(
+                    float(destination_pose["pick_tool_yaw_deg"]), 3
+                ),
+                "place_tool_yaw_deg": round(
+                    float(destination_pose["place_tool_yaw_deg"]), 3
+                ),
+                "base_rotation_deg": round(
+                    float(destination_pose["base_rotation_deg"]), 3
+                ),
+                "pick_travel_alpha_deg": round(
+                    float(pick_travel_alpha), 3
+                ),
+                "pick_contact_alpha_deg": round(float(contact_alpha), 3),
+                "place_travel_alpha_deg": VERTICAL_ALPHA_DEG,
+                "place_drop_alpha_deg": VERTICAL_ALPHA_DEG,
+                "pick_z_mm": pick_z,
+                "travel_z_mm": travel_z,
+                "drop_z_mm": drop_z,
+                "approximate_target": True,
+                "approximate_offset_mm": np.round(offset, 3).tolist(),
+                "approximate_distance_mm": round(
+                    float(np.linalg.norm(offset)), 3
+                ),
+                "approximate_reason": original_reasons.get(
+                    piece_id,
+                    "Exact destination is unreachable",
+                ),
+                "vertical_alpha_deg": VERTICAL_ALPHA_DEG,
+                "pwms": {
+                    "pick_travel": list(pick_travel_pwms),
+                    "pick_contact": list(pick_contact_pwms),
+                    "place_travel": destination_pose["place_travel"],
+                    "place_drop": destination_pose["place_drop"],
+                },
+            }
+        )
+
+    planned_ids = [int(item["piece_id"]) for item in plan]
+    final_skipped = [piece_id for piece_id in sequence if piece_id not in planned_ids]
+    for item in plan:
+        item.setdefault("approximate_target", False)
+        item.setdefault("approximate_offset_mm", [0.0, 0.0])
+        item.setdefault("approximate_distance_mm", 0.0)
+        item["total_piece_count"] = len(sequence)
+        item["planned_piece_count"] = len(planned_ids)
+        item["approximate_piece_ids"] = approximate_ids
+        item["skipped_piece_ids"] = final_skipped
+        item["skipped_reasons"] = {
+            str(piece_id): original_reasons.get(piece_id, "Unreachable")
+            for piece_id in final_skipped
+        }
+    return plan
+
+
 def build_highest_vertical_control_plan(
     envelope: dict[str, Any],
     ik,
@@ -816,11 +1175,13 @@ def build_highest_vertical_control_plan(
 ) -> list[dict[str, Any]]:
     """Return the most complete plan, then maximise travel clearance.
 
-    The minimum-clearance preflight identifies which rigid quarter-turn
-    layouts can move the most pieces.  Only those candidates are searched at
-    higher clearances.  A 4 mm grid keeps this phase fast; the selected
-    clearance and rotation are always recomputed on the requested fine grid
-    before any command can be executed.
+    The unrotated vision result always gets the first opportunity.  If its
+    complete rectangle fits below the divider and every piece is reachable at
+    an allowed travel height, no layout rotation is permitted.  Rotation is a
+    reachability-only fallback and need not be axis aligned; each candidate
+    must keep the complete fitted layout below the divider and preserve its
+    non-overlap and gap.  A 4 mm grid keeps this phase fast; the selected
+    clearance and orientation are recomputed on the fine grid before execution.
     """
 
     maximum = float(max_travel_clearance_mm)
@@ -841,7 +1202,7 @@ def build_highest_vertical_control_plan(
             angle_deg,
             _rotate_layout_envelope(envelope, angle_deg),
         )
-        for angle_deg in LAYOUT_ROTATION_CANDIDATES_DEG
+        for angle_deg in _fallback_layout_rotation_candidates()
     ]
 
     def build_candidate(
@@ -864,6 +1225,68 @@ def build_highest_vertical_control_plan(
             layout_center_weight=layout_center_weight,
         )
 
+    expected_piece_count = len(envelope.get("control_plan", []))
+
+    def finalise(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _append_nearest_reachable_fallbacks(
+            envelope,
+            plan,
+            ik,
+            paper_surface_z_mm=paper_surface_z_mm,
+            min_travel_clearance_mm=minimum,
+            layout_edge_margin_mm=layout_edge_margin_mm,
+            layout_near_edge_margin_mm=layout_near_edge_margin_mm,
+            min_pwm_margin_us=min_pwm_margin_us,
+        )
+
+    original_envelope = _rotate_layout_envelope(envelope, 0.0)
+    try:
+        original_preflight = build_candidate(
+            original_envelope,
+            minimum,
+            preflight_step,
+        )
+    except RuntimeError as error:
+        errors.append(f"unrotated preflight: {error}")
+        original_preflight = []
+
+    # Rotation exists only to recover pieces that the original rectangle
+    # cannot reach.  A lower but still allowed travel height is preferable to
+    # changing an already valid visual solution.
+    if (
+        expected_piece_count > 0
+        and len(original_preflight) >= expected_piece_count
+    ):
+        for clearance in clearances:
+            try:
+                coarse_plan = build_candidate(
+                    original_envelope,
+                    float(clearance),
+                    coarse_step,
+                )
+                if len(coarse_plan) < expected_piece_count:
+                    continue
+                if abs(coarse_step - fine_step) < 1e-9:
+                    return finalise(coarse_plan)
+                fine_plan = build_candidate(
+                    original_envelope,
+                    float(clearance),
+                    fine_step,
+                )
+                if len(fine_plan) >= expected_piece_count:
+                    return finalise(fine_plan)
+            except RuntimeError as error:
+                errors.append(
+                    f"unrotated {clearance:.1f} mm: {error}"
+                )
+        fine_original = build_candidate(
+            original_envelope,
+            minimum,
+            fine_step,
+        )
+        if len(fine_original) >= expected_piece_count:
+            return finalise(fine_original)
+
     # At minimum travel height the workspace is widest.  Its best piece count
     # is therefore the reachability ceiling that higher clearances must match.
     preflight: list[tuple[float, dict[str, Any], list[dict[str, Any]]]] = []
@@ -881,6 +1304,13 @@ def build_highest_vertical_control_plan(
                 preflight = [(angle_deg, candidate_envelope, plan)]
             elif count == best_piece_count:
                 preflight.append((angle_deg, candidate_envelope, plan))
+            if (
+                expected_piece_count > 0
+                and best_piece_count >= expected_piece_count
+            ):
+                # Angles are ordered by absolute change. Larger rotations add
+                # no value after the complete rectangle becomes reachable.
+                break
         except RuntimeError as error:
             errors.append(
                 f"preflight {angle_deg:+.0f} deg: {error}"
@@ -891,6 +1321,32 @@ def build_highest_vertical_control_plan(
             "No phase-aware plan can move any piece at minimum clearance. "
             + " | ".join(errors)
         )
+
+    # If no rigid rotation can make every theoretical destination reachable,
+    # use the widest allowed workspace before searching nearest-point
+    # fallbacks.  Returning a higher partial trajectory here would needlessly
+    # shrink the reachable set and could still leave a piece unmoved.
+    if best_piece_count < expected_piece_count:
+        best_completed: list[dict[str, Any]] | None = None
+        for angle_deg, candidate_envelope, preflight_plan in preflight:
+            try:
+                fine_plan = build_candidate(
+                    candidate_envelope,
+                    minimum,
+                    fine_step,
+                )
+            except RuntimeError as error:
+                errors.append(
+                    f"nearest fallback {angle_deg:+.0f} deg: {error}"
+                )
+                fine_plan = preflight_plan
+            completed = finalise(fine_plan)
+            if len(completed) >= expected_piece_count:
+                return completed
+            if best_completed is None or len(completed) > len(best_completed):
+                best_completed = completed
+        if best_completed:
+            return best_completed
 
     # Clearance is the primary safety preference once the maximum movable
     # piece count is known.  Candidate order keeps the original orientation
@@ -906,14 +1362,14 @@ def build_highest_vertical_control_plan(
                 if len(coarse_plan) < best_piece_count:
                     continue
                 if abs(coarse_step - fine_step) < 1e-9:
-                    return coarse_plan
+                    return finalise(coarse_plan)
                 fine_plan = build_candidate(
                     candidate_envelope,
                     float(clearance),
                     fine_step,
                 )
                 if len(fine_plan) >= best_piece_count:
-                    return fine_plan
+                    return finalise(fine_plan)
             except RuntimeError as error:
                 errors.append(
                     f"{clearance:.1f} mm, {angle_deg:+.0f} deg: {error}"
@@ -938,7 +1394,7 @@ def build_highest_vertical_control_plan(
         if best_fine is None or len(fine_plan) > len(best_fine):
             best_fine = fine_plan
     if best_fine:
-        return best_fine
+        return finalise(best_fine)
     raise RuntimeError(
         "No phase-aware plan can move any piece between "
         f"{minimum:.1f} and {maximum:.1f} mm. "
@@ -1009,9 +1465,14 @@ def save_vertical_plan_artifacts(
             2,
             cv2.LINE_AA,
         )
+        drop_label = f"P{command['piece_id']} DROP"
+        if command.get("approximate_target", False):
+            drop_label += (
+                f" APPROX +{command.get('approximate_distance_mm', 0.0):.1f}mm"
+            )
         cv2.putText(
             overlay,
-            f"P{command['piece_id']} DROP",
+            drop_label,
             (place[0] + 10, place[1] - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,

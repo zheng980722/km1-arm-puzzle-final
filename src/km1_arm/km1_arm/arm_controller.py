@@ -210,6 +210,18 @@ class ArmController(Node):
                     "Partial-score execution: skipping unreachable pieces "
                     f"{skipped_piece_ids}"
                 )
+            approximate_items = [
+                item for item in plan if item.get("approximate_target", False)
+            ]
+            for item in approximate_items:
+                self.get_logger().warning(
+                    "Nearest-reachable fallback: "
+                    f"P{item['piece_id']} theoretical="
+                    f"{item.get('theoretical_place')} -> command="
+                    f"{item['place']}, offset="
+                    f"{item.get('approximate_offset_mm')} mm, distance="
+                    f"{item.get('approximate_distance_mm', 0.0):.1f} mm"
+                )
             self.get_logger().info(
                 "Accepted schema-v2 envelope: "
                 f"planned={len(plan)}/{total_piece_count} pieces; "

@@ -177,7 +177,7 @@ class VisionConfig:
     placement_gap_mm: float = 5.0
     target_vertex_gap_mm: float = 5.0
     target_vertex_gap_tolerance_mm: float = 0.25
-    max_allowed_vertex_gap_mm: float = 12.0
+    max_allowed_vertex_gap_mm: float = 18.0
     max_post_placement_overlap_mm2: float = 0.0
 
     # OpenCV HSV values (H uses [0, 179]).  Keep the segmentation range tight
@@ -200,10 +200,10 @@ class VisionConfig:
     task1_short_edge_prune_mm: float = 5.0
     task1_minimum_valid_edge_mm: float = 5.0
     task1_search_overlap_tolerance_mm2: float = 25.0
-    task1_target_vertex_gap_mm: float = 7.0
+    task1_target_vertex_gap_mm: float = 5.0
     task2_short_edge_prune_mm: float = 10.0
     task2_search_overlap_tolerance_mm2: float = 25.0
-    task2_target_vertex_gap_mm: float = 7.0
+    task2_target_vertex_gap_mm: float = 5.0
     polygon_epsilon_mm: float = 0.5
     low_resolution_polygon_epsilon_mm: float = 5.0
     low_resolution_paper_short_edge_px: float = 400.0
@@ -343,6 +343,7 @@ class PuzzleSolution:
     rectangle_size_mm: tuple[float, float]
     placement_extent_mm: tuple[float, float]
     applied_clearance_mm: float
+    min_matched_vertex_gap_mm: float
     max_matched_vertex_gap_mm: float
     min_pairwise_gap_mm: float
     placement_overlap_area_mm2: float
@@ -422,6 +423,9 @@ class PuzzleSolution:
             "applied_clearance_mm": round(
                 float(self.applied_clearance_mm),
                 3,
+            ),
+            "min_matched_vertex_gap_mm": round(
+                float(self.min_matched_vertex_gap_mm), 3
             ),
             "max_matched_vertex_gap_mm": round(
                 float(self.max_matched_vertex_gap_mm), 3
@@ -1589,6 +1593,7 @@ def _normalise_solution_layout(
     float,
     float,
     float,
+    float,
 ]:
     polygons = _state_polygons(state, pieces)
     all_points = np.concatenate(polygons, axis=0).astype(np.float32)
@@ -1745,34 +1750,63 @@ def _normalise_solution_layout(
                 )
         return gaps
 
-    # Use rigid translations only.  The configured 5 mm value is a soft
-    # placement allowance for control error, not a rule gate on every pair.
-    # Expanding until the largest matched endpoint gap reaches that allowance
-    # reproduces the compact, previously validated layout while preserving
-    # every fragment's detected size, shape and rotation.  Piece IDs and
-    # external dimensions are never hard-coded.
+    # Use rigid translations only.  Clearance must open every matched seam,
+    # not merely the already-largest mismatched endpoint.  The former maximum
+    # test could report an 11 mm gap while another shared vertex still touched
+    # at 0 mm.  Expand until the minimum matched endpoint reaches the requested
+    # allowance, while retaining a conservative margin below the 20 mm rule.
     clearance = 0.0
     if state.matches and target_gap > 0:
+        maximum_gap = max(
+            target_gap,
+            min(20.0, float(config.max_allowed_vertex_gap_mm)),
+        )
         low = 0.0
         high = max(1.0, 0.5 * target_gap)
         apply_clearance(high)
-        high_gap = max(matched_gaps(), default=0.0)
-        while high_gap < target_gap and high < 100.0:
+        high_gaps = matched_gaps()
+        high_min_gap = min(high_gaps, default=0.0)
+        high_max_gap = max(high_gaps, default=0.0)
+        while (
+            high_min_gap < target_gap
+            and high_max_gap < maximum_gap
+            and high < 100.0
+        ):
             high *= 1.5
             apply_clearance(high)
-            high_gap = max(matched_gaps(), default=0.0)
-        for _ in range(24):
-            middle = 0.5 * (low + high)
-            apply_clearance(middle)
-            middle_gap = max(matched_gaps(), default=0.0)
-            if middle_gap < target_gap:
-                low = middle
-            else:
-                high = middle
-        clearance = high
+            high_gaps = matched_gaps()
+            high_min_gap = min(high_gaps, default=0.0)
+            high_max_gap = max(high_gaps, default=0.0)
+        target_reached = (
+            high_min_gap >= target_gap
+            and high_max_gap <= maximum_gap
+        )
+        if target_reached:
+            for _ in range(24):
+                middle = 0.5 * (low + high)
+                apply_clearance(middle)
+                middle_gaps = matched_gaps()
+                if min(middle_gaps, default=0.0) < target_gap:
+                    low = middle
+                else:
+                    high = middle
+            clearance = high
+        else:
+            # The requested allowance and maximum rule margin can conflict on
+            # an approximate edge match.  Keep the largest non-exceeding gap
+            # instead of rejecting the complete scene.
+            for _ in range(24):
+                middle = 0.5 * (low + high)
+                apply_clearance(middle)
+                if max(matched_gaps(), default=0.0) <= maximum_gap:
+                    low = middle
+                else:
+                    high = middle
+            clearance = low
 
     apply_clearance(clearance)
     matched_vertex_gaps = matched_gaps()
+    min_vertex_gap = min(matched_vertex_gaps, default=0.0)
     max_vertex_gap = max(matched_vertex_gaps, default=0.0)
     min_pairwise_gap = min(pairwise_gaps(), default=0.0)
     placement_points = np.concatenate(list(target_polygons.values()), axis=0)
@@ -1783,6 +1817,7 @@ def _normalise_solution_layout(
         target_polygons,
         (float(max(nominal_size)), float(min(nominal_size))),
         (float(max(placement_size)), float(min(placement_size))),
+        min_vertex_gap,
         max_vertex_gap,
         min_pairwise_gap,
         clearance,
@@ -1944,6 +1979,7 @@ def solve_puzzle(
             float,
             float,
             float,
+            float,
         ],
     ] | None = None
     for score, geometric, texture, state, _ in sorted(
@@ -1955,6 +1991,7 @@ def solve_puzzle(
             polygons,
             rectangle_size,
             placement_extent,
+            min_vertex_gap,
             max_vertex_gap,
             min_pairwise_gap,
             applied_clearance,
@@ -1970,6 +2007,7 @@ def solve_puzzle(
             polygons,
             rectangle_size,
             placement_extent,
+            min_vertex_gap,
             max_vertex_gap,
             min_pairwise_gap,
             applied_clearance,
@@ -2008,6 +2046,7 @@ def solve_puzzle(
         polygons,
         rectangle_size,
         placement_extent,
+        min_vertex_gap,
         max_vertex_gap,
         min_pairwise_gap,
         applied_clearance,
@@ -2048,6 +2087,7 @@ def solve_puzzle(
         rectangle_size_mm=rectangle_size,
         placement_extent_mm=placement_extent,
         applied_clearance_mm=applied_clearance,
+        min_matched_vertex_gap_mm=min_vertex_gap,
         max_matched_vertex_gap_mm=max_vertex_gap,
         min_pairwise_gap_mm=min_pairwise_gap,
         placement_overlap_area_mm2=placement_overlap,
