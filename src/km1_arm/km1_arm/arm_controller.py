@@ -57,6 +57,7 @@ class ArmController(Node):
         self.declare_parameter("travel_search_step_mm", 5.0)
         self.declare_parameter("drop_clearance_mm", 25.0)
         self.declare_parameter("layout_edge_margin_mm", 2.0)
+        self.declare_parameter("layout_near_edge_margin_mm", 2.0)
         self.declare_parameter("layout_search_step_mm", 1.0)
         self.declare_parameter("min_pwm_margin_us", 50)
         self.declare_parameter("layout_center_weight", 20.0)
@@ -88,6 +89,9 @@ class ArmController(Node):
         )
         self.layout_edge_margin_mm = float(
             self.get_parameter("layout_edge_margin_mm").value
+        )
+        self.layout_near_edge_margin_mm = float(
+            self.get_parameter("layout_near_edge_margin_mm").value
         )
         self.layout_search_step_mm = float(
             self.get_parameter("layout_search_step_mm").value
@@ -175,6 +179,9 @@ class ArmController(Node):
                 travel_search_step_mm=self.travel_search_step_mm,
                 drop_clearance_mm=self.drop_clearance_mm,
                 layout_edge_margin_mm=self.layout_edge_margin_mm,
+                layout_near_edge_margin_mm=(
+                    self.layout_near_edge_margin_mm
+                ),
                 layout_search_step_mm=self.layout_search_step_mm,
                 min_pwm_margin_us=self.min_pwm_margin_us,
                 layout_center_weight=self.layout_center_weight,

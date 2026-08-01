@@ -73,6 +73,11 @@ def generate_launch_description():
                         "travel_search_step_mm": 5.0,
                         "drop_clearance_mm": 25.0,
                         "layout_edge_margin_mm": 2.0,
+                        # Keep the reconstructed rectangle away from the A4
+                        # edge nearest the arm. The last real run left only
+                        # 2.7 mm; 13 mm is the largest tested margin that
+                        # still preserves a reachable 4/4 plan.
+                        "layout_near_edge_margin_mm": 13.0,
                         "layout_search_step_mm": 1.0,
                         "min_pwm_margin_us": 50,
                         "layout_center_weight": 20.0,

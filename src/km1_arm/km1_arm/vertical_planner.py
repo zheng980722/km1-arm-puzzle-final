@@ -31,6 +31,7 @@ PWM_MAX = 2500
 SOURCE_TARGET_DIVIDER_MM = PAPER_WIDTH_MM / 2.0
 TOOL_YAW_LIMIT_DEG = 120.0
 DEFAULT_LAYOUT_EDGE_MARGIN_MM = 2.0
+DEFAULT_LAYOUT_NEAR_EDGE_MARGIN_MM = DEFAULT_LAYOUT_EDGE_MARGIN_MM
 DEFAULT_LAYOUT_SEARCH_STEP_MM = 1.0
 DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
@@ -266,6 +267,7 @@ def _select_reachable_layout_translation(
     travel_z_mm: float,
     drop_z_mm: float,
     edge_margin_mm: float,
+    near_edge_margin_mm: float,
     search_step_mm: float,
     min_pwm_margin_us: int,
     center_weight: float,
@@ -280,6 +282,7 @@ def _select_reachable_layout_translation(
         dtype=np.float64,
     )
     margin = max(0.0, float(edge_margin_mm))
+    near_margin = max(margin, float(near_edge_margin_mm))
     piece_bounds: dict[
         int,
         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
@@ -299,7 +302,7 @@ def _select_reachable_layout_translation(
         )
         upper = np.asarray(
             [
-                PAPER_DEPTH_MM - margin - maximum[0],
+                PAPER_DEPTH_MM - near_margin - maximum[0],
                 PAPER_WIDTH_MM - margin - maximum[1],
             ],
             dtype=np.float64,
@@ -475,6 +478,7 @@ def build_vertical_control_plan(
     drop_clearance_mm: float,
     grasp_validation_clearance_mm: float = 70.0,
     layout_edge_margin_mm: float = DEFAULT_LAYOUT_EDGE_MARGIN_MM,
+    layout_near_edge_margin_mm: float = DEFAULT_LAYOUT_NEAR_EDGE_MARGIN_MM,
     layout_search_step_mm: float = DEFAULT_LAYOUT_SEARCH_STEP_MM,
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
@@ -613,6 +617,7 @@ def build_vertical_control_plan(
         travel_z_mm=travel_z,
         drop_z_mm=drop_z,
         edge_margin_mm=layout_edge_margin_mm,
+        near_edge_margin_mm=layout_near_edge_margin_mm,
         search_step_mm=layout_search_step_mm,
         min_pwm_margin_us=min_pwm_margin_us,
         center_weight=layout_center_weight,
@@ -734,6 +739,7 @@ def build_highest_vertical_control_plan(
     travel_search_step_mm: float,
     drop_clearance_mm: float,
     layout_edge_margin_mm: float = DEFAULT_LAYOUT_EDGE_MARGIN_MM,
+    layout_near_edge_margin_mm: float = DEFAULT_LAYOUT_NEAR_EDGE_MARGIN_MM,
     layout_search_step_mm: float = DEFAULT_LAYOUT_SEARCH_STEP_MM,
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
@@ -763,6 +769,7 @@ def build_highest_vertical_control_plan(
                 drop_clearance_mm=drop_clearance_mm,
                 grasp_validation_clearance_mm=minimum,
                 layout_edge_margin_mm=layout_edge_margin_mm,
+                layout_near_edge_margin_mm=layout_near_edge_margin_mm,
                 layout_search_step_mm=layout_search_step_mm,
                 min_pwm_margin_us=min_pwm_margin_us,
                 layout_center_weight=layout_center_weight,
