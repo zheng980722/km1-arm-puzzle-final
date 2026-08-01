@@ -62,7 +62,10 @@ def generate_launch_description():
                         "enable_automatic_motion": enable_motion,
                         # Raised paper is 30 mm above the floor while the
                         # robot base board is 10 mm above the floor.
-                        "paper_surface_z_mm": 20.0,
+                        # Bench observation: the previous Z reference pressed
+                        # the magnet into the A4 sheet. Raise every generated
+                        # pick, transfer, and drop pose by 5 mm.
+                        "paper_surface_z_mm": 25.0,
                         "pick_clearance_mm": 20.0,
                         "tool_length_mm": 50.0,
                         "travel_clearance_mm": 150.0,
