@@ -11,6 +11,7 @@ from the millimetre-scale A4 result published by ``vision_bridge``.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from pathlib import Path
@@ -35,6 +36,12 @@ DEFAULT_LAYOUT_NEAR_EDGE_MARGIN_MM = DEFAULT_LAYOUT_EDGE_MARGIN_MM
 DEFAULT_LAYOUT_SEARCH_STEP_MM = 1.0
 DEFAULT_MIN_PWM_MARGIN_US = 50
 DEFAULT_LAYOUT_CENTER_WEIGHT = 20.0
+# Preserve the vision orientation first, then try quarter-turn alternatives.
+# A rigid rotation keeps every inter-piece gap unchanged while allowing a long
+# reconstruction to follow the arm's radial workspace instead of crossing it.
+LAYOUT_ROTATION_CANDIDATES_DEG = (0.0, -90.0, 90.0, 180.0)
+COARSE_LAYOUT_SEARCH_STEP_MM = 4.0
+PREFLIGHT_LAYOUT_SEARCH_STEP_MM = 2.0
 VERTICAL_ALPHA_DEG = -90.0
 # Pickup contact may deviate by at most +/-8 degrees from vertical.  The order
 # is deliberate: exact vertical first, then the smallest symmetric deviation.
@@ -62,6 +69,59 @@ def _rotation_matrix(angle_deg: float) -> np.ndarray:
 
 def _normalise_angle(angle_deg: float) -> float:
     return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+
+def _rotate_layout_envelope(
+    envelope: dict[str, Any],
+    angle_deg: float,
+) -> dict[str, Any]:
+    """Return a copy whose complete solved layout is rigidly rotated.
+
+    Rotation is around the solved assembly's bounding-box centre.  The later
+    translation search remains responsible for placing that assembly inside
+    the destination half and the arm workspace.
+    """
+
+    rotated = copy.deepcopy(envelope)
+    placements = rotated.get("solution", {}).get("placements", [])
+    polygons = [
+        np.asarray(item["target_polygon_mm"], dtype=np.float64)
+        for item in placements
+        if item.get("target_polygon_mm")
+    ]
+    if not polygons:
+        rotated["layout_rotation_deg"] = float(angle_deg)
+        return rotated
+
+    all_points = np.vstack(polygons)
+    pivot = 0.5 * (
+        np.min(all_points, axis=0) + np.max(all_points, axis=0)
+    )
+    matrix = _rotation_matrix(angle_deg)
+    for placement in placements:
+        polygon = np.asarray(
+            placement["target_polygon_mm"],
+            dtype=np.float64,
+        )
+        target_pose = placement["target_pose"]
+        center = np.asarray(
+            [target_pose["x_mm"], target_pose["y_mm"]],
+            dtype=np.float64,
+        )
+        rotated_polygon = (polygon - pivot) @ matrix.T + pivot
+        rotated_center = matrix @ (center - pivot) + pivot
+        placement["target_polygon_mm"] = rotated_polygon.tolist()
+        target_pose["x_mm"] = float(rotated_center[0])
+        target_pose["y_mm"] = float(rotated_center[1])
+        if "theta_deg" in target_pose:
+            target_pose["theta_deg"] = _normalise_angle(
+                float(target_pose["theta_deg"]) + float(angle_deg)
+            )
+        placement["rotation_delta_deg"] = _normalise_angle(
+            float(placement["rotation_delta_deg"]) + float(angle_deg)
+        )
+    rotated["layout_rotation_deg"] = float(angle_deg)
+    return rotated
 
 
 def _pose_pwms(
@@ -311,22 +371,28 @@ def _select_reachable_layout_translation(
         if np.all(lower <= upper):
             valid_intervals.append((lower, upper))
 
-    if not valid_intervals:
+    if len(valid_intervals) != len(drafts):
         raise RuntimeError(
-            "No individual target fragment fits inside the destination half"
+            "Complete target layout cannot fit inside the destination half"
         )
 
-    # Search the union of every individually valid translation range. A large
-    # fallback layout may not fit as a whole, but this still finds the common
-    # shift that preserves and moves the largest possible subset.
-    lower_translation = np.min(
+    # The rotation applies to the complete reconstruction, not only to pieces
+    # that happen to be reachable.  Intersect every fragment's legal shift so
+    # every target polygon remains inside the A4 destination half even when a
+    # later IK guard can move only a subset.
+    lower_translation = np.max(
         np.vstack([interval[0] for interval in valid_intervals]),
         axis=0,
     )
-    upper_translation = np.max(
+    upper_translation = np.min(
         np.vstack([interval[1] for interval in valid_intervals]),
         axis=0,
     )
+    if np.any(lower_translation > upper_translation):
+        raise RuntimeError(
+            "Complete target layout has no translation that stays inside "
+            "the destination half"
+        )
 
     step = max(0.5, float(search_step_mm))
     starts = np.ceil(lower_translation / step) * step
@@ -662,6 +728,10 @@ def build_vertical_control_plan(
                     layout_translation,
                     3,
                 ).tolist(),
+                "layout_rotation_deg": round(
+                    float(envelope.get("layout_rotation_deg", 0.0)),
+                    3,
+                ),
                 "grasp_inset_mm": round(
                     float(draft["grasp_inset_mm"]),
                     3,
@@ -744,7 +814,14 @@ def build_highest_vertical_control_plan(
     min_pwm_margin_us: int = DEFAULT_MIN_PWM_MARGIN_US,
     layout_center_weight: float = DEFAULT_LAYOUT_CENTER_WEIGHT,
 ) -> list[dict[str, Any]]:
-    """Return the plan covering the most pieces, then the highest clearance."""
+    """Return the most complete plan, then maximise travel clearance.
+
+    The minimum-clearance preflight identifies which rigid quarter-turn
+    layouts can move the most pieces.  Only those candidates are searched at
+    higher clearances.  A 4 mm grid keeps this phase fast; the selected
+    clearance and rotation are always recomputed on the requested fine grid
+    before any command can be executed.
+    """
 
     maximum = float(max_travel_clearance_mm)
     minimum = float(min_travel_clearance_mm)
@@ -756,32 +833,112 @@ def build_highest_vertical_control_plan(
         clearances.append(minimum)
 
     errors: list[str] = []
-    expected_piece_count = len(envelope.get("control_plan", []))
-    best_partial: list[dict[str, Any]] | None = None
-    for clearance in clearances:
+    fine_step = max(0.5, float(layout_search_step_mm))
+    preflight_step = max(fine_step, PREFLIGHT_LAYOUT_SEARCH_STEP_MM)
+    coarse_step = max(fine_step, COARSE_LAYOUT_SEARCH_STEP_MM)
+    rotated_candidates = [
+        (
+            angle_deg,
+            _rotate_layout_envelope(envelope, angle_deg),
+        )
+        for angle_deg in LAYOUT_ROTATION_CANDIDATES_DEG
+    ]
+
+    def build_candidate(
+        candidate_envelope: dict[str, Any],
+        clearance_mm: float,
+        search_step_mm: float,
+    ) -> list[dict[str, Any]]:
+        return build_vertical_control_plan(
+            candidate_envelope,
+            ik,
+            paper_surface_z_mm=paper_surface_z_mm,
+            pick_clearance_mm=pick_clearance_mm,
+            travel_clearance_mm=float(clearance_mm),
+            drop_clearance_mm=drop_clearance_mm,
+            grasp_validation_clearance_mm=minimum,
+            layout_edge_margin_mm=layout_edge_margin_mm,
+            layout_near_edge_margin_mm=layout_near_edge_margin_mm,
+            layout_search_step_mm=search_step_mm,
+            min_pwm_margin_us=min_pwm_margin_us,
+            layout_center_weight=layout_center_weight,
+        )
+
+    # At minimum travel height the workspace is widest.  Its best piece count
+    # is therefore the reachability ceiling that higher clearances must match.
+    preflight: list[tuple[float, dict[str, Any], list[dict[str, Any]]]] = []
+    best_piece_count = 0
+    for angle_deg, candidate_envelope in rotated_candidates:
         try:
-            plan = build_vertical_control_plan(
-                envelope,
-                ik,
-                paper_surface_z_mm=paper_surface_z_mm,
-                pick_clearance_mm=pick_clearance_mm,
-                travel_clearance_mm=float(clearance),
-                drop_clearance_mm=drop_clearance_mm,
-                grasp_validation_clearance_mm=minimum,
-                layout_edge_margin_mm=layout_edge_margin_mm,
-                layout_near_edge_margin_mm=layout_near_edge_margin_mm,
-                layout_search_step_mm=layout_search_step_mm,
-                min_pwm_margin_us=min_pwm_margin_us,
-                layout_center_weight=layout_center_weight,
+            plan = build_candidate(
+                candidate_envelope,
+                minimum,
+                preflight_step,
             )
-            if len(plan) >= expected_piece_count:
-                return plan
-            if best_partial is None or len(plan) > len(best_partial):
-                best_partial = plan
+            count = len(plan)
+            if count > best_piece_count:
+                best_piece_count = count
+                preflight = [(angle_deg, candidate_envelope, plan)]
+            elif count == best_piece_count:
+                preflight.append((angle_deg, candidate_envelope, plan))
         except RuntimeError as error:
-            errors.append(f"{clearance:.1f} mm: {error}")
-    if best_partial:
-        return best_partial
+            errors.append(
+                f"preflight {angle_deg:+.0f} deg: {error}"
+            )
+
+    if not preflight or best_piece_count <= 0:
+        raise RuntimeError(
+            "No phase-aware plan can move any piece at minimum clearance. "
+            + " | ".join(errors)
+        )
+
+    # Clearance is the primary safety preference once the maximum movable
+    # piece count is known.  Candidate order keeps the original orientation
+    # whenever it is equally capable.
+    for clearance in clearances:
+        for angle_deg, candidate_envelope, _ in preflight:
+            try:
+                coarse_plan = build_candidate(
+                    candidate_envelope,
+                    float(clearance),
+                    coarse_step,
+                )
+                if len(coarse_plan) < best_piece_count:
+                    continue
+                if abs(coarse_step - fine_step) < 1e-9:
+                    return coarse_plan
+                fine_plan = build_candidate(
+                    candidate_envelope,
+                    float(clearance),
+                    fine_step,
+                )
+                if len(fine_plan) >= best_piece_count:
+                    return fine_plan
+            except RuntimeError as error:
+                errors.append(
+                    f"{clearance:.1f} mm, {angle_deg:+.0f} deg: {error}"
+                )
+
+    # A coarse grid can miss a very narrow IK boundary.  Exact fine-grid
+    # preflight is the deterministic fallback and still runs only once per
+    # surviving rotation candidate.
+    best_fine: list[dict[str, Any]] | None = None
+    for angle_deg, candidate_envelope, preflight_plan in preflight:
+        try:
+            fine_plan = build_candidate(
+                candidate_envelope,
+                minimum,
+                fine_step,
+            )
+        except RuntimeError as error:
+            errors.append(
+                f"fine fallback {angle_deg:+.0f} deg: {error}"
+            )
+            fine_plan = preflight_plan
+        if best_fine is None or len(fine_plan) > len(best_fine):
+            best_fine = fine_plan
+    if best_fine:
+        return best_fine
     raise RuntimeError(
         "No phase-aware plan can move any piece between "
         f"{minimum:.1f} and {maximum:.1f} mm. "
