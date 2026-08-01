@@ -11,8 +11,10 @@ log/
 # Runtime captures and diagnostic artifacts
 vertical_runs/
 vision_logs/
+button_runs/
 puzzle_vision/outputs/
 puzzle_vision/vision_output/
 
 # Local dependency/cache directories
+.venv/
 puzzle_vision/node_modules/
